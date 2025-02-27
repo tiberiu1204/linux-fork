@@ -410,6 +410,10 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	if (IS_ERR_VALUE(addr))
 		return addr;
 
+	unsigned long error = security_mmap_addr_size_prot(addr, len, prot);
+	if (error)
+		return error;
+
 	if (flags & MAP_FIXED_NOREPLACE) {
 		if (find_vma_intersection(mm, addr, addr + len))
 			return -EEXIST;

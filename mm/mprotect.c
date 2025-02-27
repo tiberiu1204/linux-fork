@@ -827,6 +827,10 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		if (error)
 			break;
 
+		error = security_mprotect_addr_size_prot(start, len, prot);
+		if (error)
+			break;
+
 		tmp = vma->vm_end;
 		if (tmp > end)
 			tmp = end;

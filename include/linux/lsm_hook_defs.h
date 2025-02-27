@@ -194,6 +194,8 @@ LSM_HOOK(int, 0, file_ioctl, struct file *file, unsigned int cmd,
 LSM_HOOK(int, 0, file_ioctl_compat, struct file *file, unsigned int cmd,
 	 unsigned long arg)
 LSM_HOOK(int, 0, mmap_addr, unsigned long addr)
+LSM_HOOK(int, 0, mmap_addr_size_prot, unsigned long addr, unsigned long len, unsigned long prot)
+LSM_HOOK(int, 0, mprotect_addr_size_prot, unsigned long addr, unsigned long len, unsigned long prot)
 LSM_HOOK(int, 0, mmap_file, struct file *file, unsigned long reqprot,
 	 unsigned long prot, unsigned long flags)
 LSM_HOOK(int, 0, file_mprotect, struct vm_area_struct *vma,
