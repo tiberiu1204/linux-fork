@@ -1,0 +1,3 @@
+config SECURITY_MCHECK_LSM
+	bool "Enable security checks on memory mappings"
+	depends on SECURITY

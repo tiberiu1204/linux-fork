@@ -2996,6 +2996,16 @@ int security_mmap_addr(unsigned long addr)
 	return call_int_hook(mmap_addr, addr);
 }
 
+int security_mmap_addr_size_prot(unsigned long addr, unsigned long len, unsigned long prot)
+{
+	return call_int_hook(mmap_addr_size_prot, addr, len, prot);
+}
+
+int security_mprotect_addr_size_prot(unsigned long addr, unsigned long len, unsigned long prot)
+{
+	return call_int_hook(mprotect_addr_size_prot, addr, len, prot);
+}
+
 /**
  * security_file_mprotect() - Check if changing memory protections is allowed
  * @vma: memory region
