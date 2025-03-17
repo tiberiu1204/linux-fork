@@ -3,8 +3,10 @@
 #include "linux/mm.h"
 #include "linux/mm_types.h"
 #include "linux/mman.h"
+#include "linux/mmap_lock.h"
 #include "linux/printk.h"
 #include "linux/sched.h"
+#include "linux/sched/mm.h"
 #include <linux/security.h>
 #include <linux/export.h>
 #include <linux/lsm_hooks.h>
@@ -141,7 +143,8 @@ static int mcheck_file_mprotect(struct vm_area_struct *vma, unsigned long reqpro
     return 0;
 }
 
-struct completion mmap_analyzer_thread_ready;
+static struct completion analyzer_mmap_done;
+static struct completion analyzer_munmap_ready;
 struct mmap_analyzer_thread_data {
     struct mm_struct *analyzer_mm;
     unsigned long len;
@@ -150,28 +153,38 @@ struct mmap_analyzer_thread_data {
     unsigned long address;
 };
 static int mmap_analyzer_thread(void *arg) {
-    complete(&mmap_analyzer_thread_ready);
 
-    int ret = 0;
     struct mmap_analyzer_thread_data *data = (struct mmap_analyzer_thread_data *)arg;
-
 
     // kthread_use_mm can only be called from a kernel thread
     kthread_use_mm(data->analyzer_mm);
-    data->address = vm_mmap(data->vma->vm_file, 0, data->len, PROT_READ, MAP_PRIVATE, 0);
-    if (!data->analyzer_mm) {
-        pr_err("mcheck_custom_mmap_hook: failed to map file\n");
-        ret = -ENOMEM;
+    if  (data->vma) {
+        data->address = vm_mmap(data->vma->vm_file, 0, data->len, PROT_READ, MAP_PRIVATE, data->vma->vm_pgoff * PAGE_SIZE);
+    } else {
+        data->address = vm_mmap(NULL, 0, data->len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, 0);
     }
-    pr_info("mapped address: %lx\n", data->address);
-    kthread_unuse_mm(data->analyzer_mm);
-    mmput(data->analyzer_mm);
 
+    init_completion(&analyzer_munmap_ready);
+    complete(&analyzer_mmap_done);
+
+    if (!data->address) {
+        pr_err("mcheck_custom_mmap_hook: failed to map file\n");
+        while(!kthread_should_stop()) {
+            schedule();
+        }
+        return -ENOMEM;
+    }
+        
+    pr_info("mapped address: %lx\n", data->address);
+    wait_for_completion(&analyzer_munmap_ready);
+
+    vm_munmap(data->address, data->len);
+    kthread_unuse_mm(data->analyzer_mm);
 
     while(!kthread_should_stop()) {
         schedule();
     }
-    return ret;
+    return 0;
 }
 
 
@@ -219,8 +232,9 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsign
     analyzer_data->analyzer_mm = analyzer_mm;
     analyzer_data->len = len;
     analyzer_data->vma = vma;
+    analyzer_data->address = 0;
 
-    init_completion(&mmap_analyzer_thread_ready);
+    init_completion(&analyzer_mmap_done);
     struct task_struct *task = kthread_run(mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
 
     if (IS_ERR(task)) {
@@ -229,17 +243,27 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsign
         return 0;
     }
 
-    wait_for_completion(&mmap_analyzer_thread_ready);
-
-    int ret = kthread_stop(task);
-
-    if (ret) {
-        pr_err("Failed to stop kernel thread: %d\n", ret);
-    } else {
-        lsm_send_address(analyzer_data->address);
-        wait_for_completion(&analyzer_ready);
-        reinit_completion(&analyzer_ready);
+    wait_for_completion(&analyzer_mmap_done);
+    if (!analyzer_data->address) {
+        pr_err("mcheck_custom_mmap_hook: failed to map file\n");
+        kthread_stop(task);
+        mmput(analyzer_mm);
+        kfree(analyzer_data);
+        return 0;
     }
+
+    // send address to user-space
+    lsm_send_address(analyzer_data->address);
+
+    // wait for user-space analysis
+    wait_for_completion(&analyzer_ready);
+    reinit_completion(&analyzer_ready);
+
+    // ready to unmap file
+    complete(&analyzer_munmap_ready);
+
+    kthread_stop(task);
+    mmput(analyzer_mm);
 
     kfree(analyzer_data);
     return -analyzer_response;
@@ -248,6 +272,136 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsign
 static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len, unsigned long prot)
 {
     //pr_info("mcheck_custom_mprotect_hook: addr = %lx, len = %lx, prot = %lx\n", addr, len, prot);
+
+    // analyzer task is not set yet
+    if (!analyzer_task) {
+        return 0;
+    }
+
+    // we are only interested in executable mappings
+    if (!(prot & PROT_EXEC)) {
+        return 0;
+    }
+
+    // mapping in analyzer's address space
+    if (current->active_mm == analyzer_task->mm) {
+        return 0;
+    }
+
+    // alloc memory in analyzer's address space
+    struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
+    if (!analyzer_mm) {
+        pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm\n");
+        return -EINVAL;
+    }
+
+    struct mmap_analyzer_thread_data *analyzer_data = kmalloc(sizeof(struct mmap_analyzer_thread_data), GFP_KERNEL);
+    if (!analyzer_data) {
+        pr_err("mcheck_custom_mmap_hook: failed to allocate memory\n");
+        return -ENOMEM;
+    }
+    analyzer_data->analyzer_mm = analyzer_mm;
+    analyzer_data->len = len;
+    analyzer_data->vma = NULL;
+    analyzer_data->address = 0;
+
+    init_completion (&analyzer_mmap_done);
+    struct task_struct *task = kthread_run(mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
+
+    if (IS_ERR(task)) {
+        pr_err("Failed to create kernel thread: %ld\n", PTR_ERR(task));
+        kfree(analyzer_data);
+        return 0;
+    }
+
+    // pin pages
+    unsigned long pages_no = (len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    struct page **pages = kmalloc(sizeof(struct page *) * pages_no, GFP_KERNEL);
+    if (!pages) {
+        pr_err("mcheck_custom_mprotect_hook: failed to allocate memory\n");
+        return -ENOMEM;
+    }
+
+    pr_info("try to pin %lu pages\n", pages_no);
+
+    // mmap_lock already acquired in mprotect!
+    int pinned_pages = get_user_pages(addr, pages_no, FOLL_FORCE, pages);
+    if (pinned_pages < 0) {
+        pr_err("mcheck_custom_mprotect_hook: failed to pin pages\n");
+        kfree(pages);
+        return -ENOMEM;
+    }
+
+    pr_info("pinning ok : pages_no = %lu, pinned_pages = %d\n", pages_no, pinned_pages);
+
+    // memory allocation in analyzer's address space is done
+    wait_for_completion(&analyzer_mmap_done);
+
+    if (!analyzer_data->address) {
+        pr_err("mcheck_custom_mprotect_hook: failed to mmap in analyzer\n");
+        // unpin pages
+        for (int i = 0; i < pinned_pages; i++) {
+            put_page(pages[i]);
+        }
+        kfree(pages);
+        kthread_stop(task);
+        kfree(analyzer_data);
+        mmput(analyzer_mm);
+        return 0;
+    }
+
+    // map pages in analyzer's address space
+    int remapping_ok = 1;
+    mmap_write_lock(analyzer_mm);
+    struct vm_area_struct *analyzer_vma = find_vma(analyzer_mm, analyzer_data->address);
+
+    // copy-on-write mappings are a special case, we don't need to write so we clear the flag
+    vm_flags_clear(analyzer_vma, VM_MAYWRITE);
+    if (!analyzer_vma) {
+        pr_err("mcheck_custom_mprotect_hook: failed to find vma\n");
+        remapping_ok = 0;
+    }
+    for (int i = 0; i < pinned_pages; i++) {
+        if (!remapping_ok) {
+            break;
+        }
+        unsigned long pfn = page_to_pfn(pages[i]);
+        unsigned long size = PAGE_SIZE;
+        if (i == pinned_pages - 1) {
+            size = len - i * PAGE_SIZE;
+        }
+        int ret = remap_pfn_range(analyzer_vma, analyzer_data->address + i * PAGE_SIZE, pfn, size, analyzer_vma->vm_page_prot);
+        if (ret) {
+            pr_err("mcheck_custom_mprotect_hook: remap_pfn_range err = %d; i = %d\n", ret, i);
+            remapping_ok = 0;
+        }
+    }
+    mmap_write_unlock(analyzer_mm);
+
+    if (remapping_ok) {
+        pr_info("mcheck_custom_mprotect_hook: remapping ok\n");
+        lsm_send_address(analyzer_data->address);
+        wait_for_completion(&analyzer_ready);
+        reinit_completion(&analyzer_ready);
+    } else {
+        pr_err("mcheck_custom_mprotect_hook: remapping failed\n");
+    }
+
+    // unmap memory from analyzer
+    complete(&analyzer_munmap_ready);
+    kthread_stop(task);
+    mmput(analyzer_mm);
+
+    // unpin pages
+    for (int i = 0; i < pinned_pages; i++) {
+        put_page(pages[i]);
+    }
+    kfree(pages);
+    kfree(analyzer_data);
+
+    if (remapping_ok) {
+        return -analyzer_response;
+    }
     return 0;
 }
 static struct security_hook_list mcheck_hooks[] __ro_after_init = {
