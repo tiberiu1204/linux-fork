@@ -28,7 +28,8 @@ static struct completion analyzer_ready;
 // Attribute policy (validation)
 static struct nla_policy lsm_policy[LSM_ATTR_MAX + 1] = {
     [LSM_ATTR_ADDRESS] = { .type = NLA_U64 },
-    [LSM_ATTR_RESPONSE] = { .type = NLA_U32 },
+    [LSM_ATTR_LENGTH] = { .type = NLA_U64 },
+    [LSM_ATTR_RESPONSE] = { .type = NLA_S32 },
 };
 static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info);
 // Command handler mapping
@@ -65,7 +66,7 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
         return -EINVAL;
     }
 
-    int user_response = nla_get_u32(info->attrs[LSM_ATTR_RESPONSE]);
+    int user_response = (int) nla_get_s32(info->attrs[LSM_ATTR_RESPONSE]);
     pr_info("LSM: Received response from user-space: %d\n", user_response);
 
     // register the analyzer task
@@ -86,7 +87,8 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
     return 0;
 }
 
-static int lsm_send_address(unsigned long addr) {
+static int lsm_send_to_userspace(unsigned long addr, unsigned long len)
+{
     struct sk_buff *skb;
     void *msg_head;
     int ret;
@@ -110,6 +112,13 @@ static int lsm_send_address(unsigned long addr) {
     ret = nla_put_u64_64bit(skb, LSM_ATTR_ADDRESS, addr, 0);
     if (ret) {
         pr_err("LSM: Failed to add address attribute to Netlink message\n");
+        genlmsg_cancel(skb, msg_head);
+        nlmsg_free(skb);
+        return ret;
+    }
+    ret = nla_put_u64_64bit(skb, LSM_ATTR_LENGTH, len, 0);
+    if (ret) {
+        pr_err("LSM: Failed to add length attribute to Netlink message\n");
         genlmsg_cancel(skb, msg_head);
         nlmsg_free(skb);
         return ret;
@@ -252,8 +261,8 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsign
         return 0;
     }
 
-    // send address to user-space
-    lsm_send_address(analyzer_data->address);
+    // send info to user-space
+    lsm_send_to_userspace(analyzer_data->address, len);
 
     // wait for user-space analysis
     wait_for_completion(&analyzer_ready);
@@ -380,7 +389,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len, un
 
     if (remapping_ok) {
         pr_info("mcheck_custom_mprotect_hook: remapping ok\n");
-        lsm_send_address(analyzer_data->address);
+        lsm_send_to_userspace(analyzer_data->address, len);
         wait_for_completion(&analyzer_ready);
         reinit_completion(&analyzer_ready);
     } else {

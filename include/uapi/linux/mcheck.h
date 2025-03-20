@@ -4,8 +4,9 @@
 // Attributes (what we send/receive)
 enum {
     LSM_ATTR_UNSPEC,
-    LSM_ATTR_ADDRESS,  // Memory address (unsigned long)
-    LSM_ATTR_RESPONSE, // User-space response (unsigned long)
+    LSM_ATTR_ADDRESS,  // Memory address (u64)
+    LSM_ATTR_LENGTH,   // Memory length (u64)
+    LSM_ATTR_RESPONSE, // User-space response (i32)
     __LSM_ATTR_MAX,
 };
 #define LSM_ATTR_MAX (__LSM_ATTR_MAX - 1)
