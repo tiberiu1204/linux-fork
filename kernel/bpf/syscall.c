@@ -2957,6 +2957,11 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	if (err < 0)
 		goto free_used_maps;
 
+	/* after jit */
+	err = security_bpf_prog_load(prog, attr, token);
+	if (err)
+		goto free_prog_sec;
+
 	err = bpf_prog_alloc_id(prog);
 	if (err)
 		goto free_used_maps;

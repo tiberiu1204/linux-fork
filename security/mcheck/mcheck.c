@@ -413,11 +413,31 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len, un
     }
     return 0;
 }
+
+static int bpf_prog_hook(struct bpf_prog *prog, union bpf_attr *attr, struct bpf_token *token)
+{
+    pr_info("bpf_prog_hook: prog nr_linfo: %d\n", prog->aux->nr_linfo);
+    pr_info("bpf_prog_hook: prog size: %d\n", prog->len);
+    pr_info("bpf_prog_hook: prog jited: %d\n", prog->jited);
+    pr_info("bpf_prog_hook: prog jited len: %d\n", prog->jited_len);
+    pr_info("bpf_prog_hook: prog bpf_func: %p\n", prog->bpf_func);
+    if (prog->bpf_func) {
+        // print first 29 bytes
+        unsigned char *bpf_func = (unsigned char *) prog->bpf_func;
+        pr_info("bpf_prog_hook: prog bpf_func: ");
+        for (int i = 0; i < 29; i++) {
+            pr_cont("%02x ", bpf_func[i]);
+        }
+        pr_cont("\n");
+    }
+    return 0;
+}
 static struct security_hook_list mcheck_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(mmap_addr, mcheck_mmap_addr),
     LSM_HOOK_INIT(file_mprotect, mcheck_file_mprotect),
     LSM_HOOK_INIT(mmap_addr_size_prot, mcheck_custom_mmap_hook),
     LSM_HOOK_INIT(mprotect_addr_size_prot, mcheck_custom_mprotect_hook),
+    LSM_HOOK_INIT(bpf_prog_load, bpf_prog_hook),
 };
 
 static const struct lsm_id mcheck_lsmid = {
