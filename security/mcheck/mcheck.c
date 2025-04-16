@@ -158,6 +158,7 @@ struct mmap_analyzer_thread_data {
     struct mm_struct *analyzer_mm;
     unsigned long len;
     struct vm_area_struct *vma;
+    void *init_data;
 
     unsigned long address;
 };
@@ -170,7 +171,19 @@ static int mmap_analyzer_thread(void *arg) {
     if  (data->vma) {
         data->address = vm_mmap(data->vma->vm_file, 0, data->len, PROT_READ, MAP_PRIVATE, data->vma->vm_pgoff * PAGE_SIZE);
     } else {
-        data->address = vm_mmap(NULL, 0, data->len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, 0);
+        if (data->init_data) {
+            data->address = vm_mmap(NULL, 0, data->len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0);
+        } else {
+            data->address = vm_mmap(NULL, 0, data->len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, 0);
+        }
+        if (data->address && data->init_data) { 
+            int res = copy_to_user((void __user *)data->address, data->init_data, data->len);
+            if (res) {
+                pr_err("mcheck_custom_mmap_hook: failed to copy data to user\n");
+                vm_munmap(data->address, data->len);
+                data->address = 0;
+            }
+        }
     }
 
     init_completion(&analyzer_munmap_ready);
@@ -242,6 +255,7 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsign
     analyzer_data->len = len;
     analyzer_data->vma = vma;
     analyzer_data->address = 0;
+    analyzer_data->init_data = NULL;
 
     init_completion(&analyzer_mmap_done);
     struct task_struct *task = kthread_run(mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
@@ -313,6 +327,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len, un
     analyzer_data->len = len;
     analyzer_data->vma = NULL;
     analyzer_data->address = 0;
+    analyzer_data->init_data = NULL;
 
     init_completion (&analyzer_mmap_done);
     struct task_struct *task = kthread_run(mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
@@ -414,30 +429,82 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len, un
     return 0;
 }
 
+#ifdef CONFIG_BPF_SYSCALL
 static int bpf_prog_hook(struct bpf_prog *prog, union bpf_attr *attr, struct bpf_token *token)
 {
-    pr_info("bpf_prog_hook: prog nr_linfo: %d\n", prog->aux->nr_linfo);
-    pr_info("bpf_prog_hook: prog size: %d\n", prog->len);
-    pr_info("bpf_prog_hook: prog jited: %d\n", prog->jited);
-    pr_info("bpf_prog_hook: prog jited len: %d\n", prog->jited_len);
-    pr_info("bpf_prog_hook: prog bpf_func: %p\n", prog->bpf_func);
-    if (prog->bpf_func) {
-        // print first 29 bytes
-        unsigned char *bpf_func = (unsigned char *) prog->bpf_func;
-        pr_info("bpf_prog_hook: prog bpf_func: ");
-        for (int i = 0; i < 29; i++) {
-            pr_cont("%02x ", bpf_func[i]);
-        }
-        pr_cont("\n");
+    if (!prog->jited) {
+        // only jited programs are interesting
+        return 0;
     }
-    return 0;
+    if (!prog->bpf_func) {
+        pr_err("bpf_prog_hook: prog bpf_func is NULL\n");
+        return 0;
+    }
+
+    // analyzer task is not set yet
+    if (!analyzer_task) {
+        return 0;
+    }
+
+    struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
+    if (!analyzer_mm) {
+        pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm\n");
+        return -EINVAL;
+    }
+
+    struct mmap_analyzer_thread_data *analyzer_data = kmalloc(sizeof(struct mmap_analyzer_thread_data), GFP_KERNEL);
+    if (!analyzer_data) {
+        pr_err("mcheck_custom_mmap_hook: failed to allocate memory\n");
+        return -ENOMEM;
+    }
+    analyzer_data->analyzer_mm = analyzer_mm;
+    analyzer_data->len = prog->jited_len;
+    analyzer_data->vma = NULL;
+    analyzer_data->address = 0;
+    analyzer_data->init_data = prog->bpf_func;
+
+    init_completion(&analyzer_mmap_done);
+    struct task_struct *task = kthread_run(mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
+    if (IS_ERR(task)) {
+        pr_err("Failed to create kernel thread: %ld\n", PTR_ERR(task));
+        kfree(analyzer_data);
+        return 0;
+    }
+    wait_for_completion(&analyzer_mmap_done);
+
+    if (!analyzer_data->address) {
+        pr_err("mcheck_custom_mmap_hook: failed to mmap in analyzer\n");
+        kthread_stop(task);
+        kfree(analyzer_data);
+        return 0;
+    }
+
+    // send info to user-space
+    lsm_send_to_userspace(analyzer_data->address, prog->jited_len);
+
+    // wait for user-space analysis
+    wait_for_completion(&analyzer_ready);
+    reinit_completion(&analyzer_ready);
+
+    // ready to unmap file
+    complete(&analyzer_munmap_ready);
+
+    kthread_stop(task);
+    mmput(analyzer_mm);
+    kfree(analyzer_data);
+
+    return -analyzer_response;
 }
+#endif
+
 static struct security_hook_list mcheck_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(mmap_addr, mcheck_mmap_addr),
     LSM_HOOK_INIT(file_mprotect, mcheck_file_mprotect),
     LSM_HOOK_INIT(mmap_addr_size_prot, mcheck_custom_mmap_hook),
     LSM_HOOK_INIT(mprotect_addr_size_prot, mcheck_custom_mprotect_hook),
+    #ifdef CONFIG_BPF_SYSCALL
     LSM_HOOK_INIT(bpf_prog_load, bpf_prog_hook),
+    #endif
 };
 
 static const struct lsm_id mcheck_lsmid = {
