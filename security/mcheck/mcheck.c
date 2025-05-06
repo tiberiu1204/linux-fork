@@ -7,6 +7,8 @@
 #include "linux/printk.h"
 #include "linux/sched.h"
 #include "linux/sched/mm.h"
+#include "linux/spinlock.h"
+#include "linux/timekeeping.h"
 #include <linux/security.h>
 #include <linux/export.h>
 #include <linux/lsm_hooks.h>
@@ -14,11 +16,15 @@
 #include <linux/netlink.h>
 #include <net/genetlink.h>
 #include <linux/mcheck.h>
+#include <linux/device.h>
+#include <linux/cdev.h>
 
 #ifdef pr_fmt
 #   undef pr_fmt
 #endif
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt "\n"
+
+int init_char_device(void);
 
 static struct task_struct *analyzer_task = NULL;
 static unsigned int analyzer_response = 0;
@@ -77,6 +83,7 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
             pr_err("LSM: Failed to find analyzer task\n");
             return -EINVAL;
         }
+        init_char_device();
         return 0;
     }
 
@@ -532,4 +539,258 @@ DEFINE_LSM(mcheck) = {
     .name = "mcheck",
     .init = mcheck_lsm_init,
 };
-    
+
+
+#define DEVICE_NAME "lsm_perf"
+#define CLASS_NAME "lsm_perf_class"
+#define PERFBUF_SIZE 40960
+
+static dev_t perf_dev;
+static struct cdev perf_cdev;
+static struct class *perf_class;
+static char *perf_buffer;
+static size_t perf_buf_head = 0;
+static size_t perf_buf_tail = 0;
+static DEFINE_SPINLOCK(perf_lock);
+
+static ssize_t perfchar_read(struct file *filep, char __user *buf, size_t len, loff_t *offset) {
+    ssize_t ret = 0;
+
+    spin_lock(&perf_lock);
+
+    if (perf_buf_head == perf_buf_tail) {
+        spin_unlock(&perf_lock);
+        return 0;  // No data to read
+    }
+
+    // Calculate the available data in the buffer
+    size_t available_data = (perf_buf_head >= perf_buf_tail)
+                                ? (perf_buf_head - perf_buf_tail)
+                                : (PERFBUF_SIZE - perf_buf_tail + perf_buf_head);
+
+    // Limit the read length to the available data
+    if (len > available_data) {
+        len = available_data;
+    }
+
+    if (perf_buf_tail + len <= PERFBUF_SIZE) {
+        // Single contiguous read
+        if (copy_to_user(buf, perf_buffer + perf_buf_tail, len) != 0) {
+            spin_unlock(&perf_lock);
+            return -EFAULT;
+        }
+        perf_buf_tail = (perf_buf_tail + len) % PERFBUF_SIZE;
+    } else {
+        // Split read into two parts
+        size_t first_part = PERFBUF_SIZE - perf_buf_tail;
+        size_t second_part = len - first_part;
+
+        if (copy_to_user(buf, perf_buffer + perf_buf_tail, first_part) != 0 ||
+            copy_to_user(buf + first_part, perf_buffer, second_part) != 0) {
+            spin_unlock(&perf_lock);
+            return -EFAULT;
+        }
+
+        perf_buf_tail = second_part;
+    }
+
+    ret = len;
+    spin_unlock(&perf_lock);
+    return ret;
+}
+
+static void perfchar_write(const char *data, size_t len) {
+    spin_lock(&perf_lock);
+
+    // Write data in two parts if it wraps around the buffer boundary
+    if (perf_buf_head + len <= PERFBUF_SIZE) {
+        // Single contiguous write
+        memcpy(perf_buffer + perf_buf_head, data, len);
+        perf_buf_head = (perf_buf_head + len) % PERFBUF_SIZE;
+    } else {
+        // Split write into two parts
+        size_t first_part = PERFBUF_SIZE - perf_buf_head;
+        size_t second_part = len - first_part;
+
+        memcpy(perf_buffer + perf_buf_head, data, first_part);
+        memcpy(perf_buffer, data + first_part, second_part);
+
+        perf_buf_head = second_part;
+    }
+
+    // Overwrite old data if the buffer is full
+    if (perf_buf_head == perf_buf_tail) {
+        perf_buf_tail = (perf_buf_tail + len) % PERFBUF_SIZE;
+    }
+
+    spin_unlock(&perf_lock);
+}
+
+static const struct file_operations perf_fops = {
+    .owner = THIS_MODULE,
+    .read = perfchar_read,
+};
+
+int init_char_device(void) {
+    int ret;
+
+    perf_buffer = kzalloc(PERFBUF_SIZE, GFP_KERNEL);
+    if (!perf_buffer)
+        return -ENOMEM;
+
+    ret = alloc_chrdev_region(&perf_dev, 0, 1, DEVICE_NAME);
+    if (ret < 0)
+        return ret;
+
+    cdev_init(&perf_cdev, &perf_fops);
+    perf_cdev.owner = THIS_MODULE;
+
+    ret = cdev_add(&perf_cdev, perf_dev, 1);
+    if (ret)
+        goto err_unregister;
+
+    perf_class = class_create(CLASS_NAME);
+    if (IS_ERR(perf_class)) {
+        ret = PTR_ERR(perf_class);
+        goto err_cdev_del;
+    }
+
+    if (IS_ERR(device_create(perf_class, NULL, perf_dev, NULL, DEVICE_NAME))) {
+        ret = -ENOMEM;
+        goto err_class_destroy;
+    }
+
+    pr_info("Performance char device initialized\n");
+    return 0;
+
+err_class_destroy:
+    class_destroy(perf_class);
+err_cdev_del:
+    cdev_del(&perf_cdev);
+err_unregister:
+    unregister_chrdev_region(perf_dev, 1);
+    kfree(perf_buffer);
+    return ret;
+}
+
+uint64_t mmap_hook_start_time = 0;
+uint64_t mprotect_hook_start_time = 0;
+uint64_t lsm_send_to_userspace_start_time = 0;
+uint64_t lsm_receive_reply_start_time = 0;
+uint64_t mmap_analyzer_thread_start_time = 0;
+
+uint64_t mmap_hook_counter = 0;
+uint64_t mprotect_hook_counter = 0;
+
+char in_mmap_hook = 0;
+char in_mprotect_hook = 0;
+
+char mmap_relevant = 0;
+char mprotect_relevant = 0;
+
+__attribute__((no_instrument_function))
+void __cyg_profile_func_enter(void *this_fn, void *call_site)
+{
+    if (analyzer_task == NULL) {
+        return;
+    }
+    if (this_fn == mcheck_custom_mmap_hook) {
+        mmap_hook_start_time = ktime_get_ns();
+        in_mmap_hook++;
+        mmap_relevant = 0;
+    } else if (this_fn == mcheck_custom_mprotect_hook) {
+        mprotect_hook_start_time = ktime_get_ns();
+        in_mprotect_hook = 1;
+        mprotect_relevant = 0;
+    } else if (this_fn == lsm_send_to_userspace) {
+        lsm_send_to_userspace_start_time = ktime_get_ns();
+    } else if (this_fn == lsm_receive_reply) {
+        lsm_receive_reply_start_time = ktime_get_ns();
+    } else if (this_fn == mmap_analyzer_thread) {
+        mmap_analyzer_thread_start_time = ktime_get_ns();
+    }
+}
+
+__attribute__((no_instrument_function))
+void __cyg_profile_func_exit(void *this_fn, void *call_site)
+{
+    if (analyzer_task == NULL) {
+        return;
+    }
+    if (this_fn == mcheck_custom_mmap_hook) {
+        uint64_t mmap_hook_end_time = ktime_get_ns();
+        in_mmap_hook--;
+        if (!mmap_relevant) {
+            return;            
+        }
+        // pr_info("mcheck_custom_mmap_hook: elapsed time = %llu ns\n", mmap_hook_end_time - mmap_hook_start_time);
+
+        char temp_buffer[64];
+        int len = snprintf(temp_buffer, sizeof(temp_buffer), "mmap,mmap_hook,%llu,%llu\n", mmap_hook_counter, mmap_hook_end_time - mmap_hook_start_time);
+
+        perfchar_write(temp_buffer, len);
+        pr_info("exiting in_mmap_hook = %d\n", in_mmap_hook);
+        mmap_hook_counter++;
+    } else if (this_fn == mcheck_custom_mprotect_hook) {
+        uint64_t mprotect_hook_end_time = ktime_get_ns();
+        in_mprotect_hook = 0;
+        if (!mprotect_relevant) {
+            return;            
+        }
+        // pr_info("mcheck_custom_mprotect_hook: elapsed time = %llu ns\n", mprotect_hook_end_time - mprotect_hook_start_time);
+
+        char temp_buffer[64];
+        int len = snprintf(temp_buffer, sizeof(temp_buffer), "mprotect,mprotect_hook,%llu,%llu\n", mprotect_hook_counter, mprotect_hook_end_time - mprotect_hook_start_time);
+
+        perfchar_write(temp_buffer, len);
+        mprotect_hook_counter++;
+    } else if (this_fn == lsm_send_to_userspace) {
+        uint64_t lsm_send_to_userspace_end_time = ktime_get_ns();
+        pr_info("lsm_send_to_userspace: elapsed time = %llu ns\n", lsm_send_to_userspace_end_time - lsm_send_to_userspace_start_time);
+        pr_info("in_mmap_hook = %d, in_mprotect_hook = %d\n", in_mmap_hook, in_mprotect_hook);
+        
+        char temp_buffer[64];
+        int len = 0;
+
+        if (in_mmap_hook) {
+            mmap_relevant = 1;
+            len = snprintf(temp_buffer, sizeof(temp_buffer), "mmap,lsm_send_to_userspace,%llu,%llu\n", mmap_hook_counter, lsm_send_to_userspace_end_time - lsm_send_to_userspace_start_time);
+        } else if (in_mprotect_hook) {
+            mprotect_relevant = 1;
+            len = snprintf(temp_buffer, sizeof(temp_buffer), "mprotect,lsm_send_to_userspace,%llu,%llu\n", mprotect_hook_counter, lsm_send_to_userspace_end_time - lsm_send_to_userspace_start_time);
+        }
+
+        perfchar_write(temp_buffer, len);
+    } else if (this_fn == lsm_receive_reply) {
+        if (lsm_receive_reply_start_time == 0) {
+            return;
+        }
+        uint64_t lsm_receive_reply_end_time = ktime_get_ns();
+        // pr_info("lsm_receive_reply: elapsed time = %llu ns\n", lsm_receive_reply_end_time - lsm_receive_reply_start_time);
+
+        char temp_buffer[64];
+        int len = 0;
+
+        if (in_mmap_hook) {
+            len = snprintf(temp_buffer, sizeof(temp_buffer), "mmap,lsm_receive_reply,%llu,%llu\n", mmap_hook_counter, lsm_receive_reply_end_time - lsm_receive_reply_start_time);
+        } else if (in_mprotect_hook) {
+            len = snprintf(temp_buffer, sizeof(temp_buffer), "mprotect,lsm_receive_reply,%llu,%llu\n", mprotect_hook_counter, lsm_receive_reply_end_time - lsm_receive_reply_start_time);
+        }
+
+        perfchar_write(temp_buffer, len);
+    } else if (this_fn == mmap_analyzer_thread) {
+        uint64_t mmap_analyzer_thread_end_time = ktime_get_ns();
+        // pr_info("mmap_analyzer_thread: elapsed time = %llu ns\n", mmap_analyzer_thread_end_time - mmap_analyzer_thread_start_time);
+
+        char temp_buffer[64];
+        int len = 0;
+        
+        if (in_mmap_hook) {
+            len = snprintf(temp_buffer, sizeof(temp_buffer), "mmap,mmap_analyzer_thread,%llu,%llu\n", mmap_hook_counter, mmap_analyzer_thread_end_time - mmap_analyzer_thread_start_time);
+        } else if (in_mprotect_hook) {
+            len = snprintf(temp_buffer, sizeof(temp_buffer), "mprotect,mmap_analyzer_thread,%llu,%llu\n", mprotect_hook_counter, mmap_analyzer_thread_end_time - mmap_analyzer_thread_start_time);
+        }
+
+        perfchar_write(temp_buffer, len);
+    }
+}
