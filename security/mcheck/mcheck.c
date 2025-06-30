@@ -91,10 +91,19 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
     analyzer_response = user_response;
     complete(&analyzer_ready);
 
-    return 0;
+	return 0;
 }
 
-static int lsm_send_to_userspace(unsigned long addr, unsigned long len)
+struct mapping_info {
+	unsigned long pid;
+	unsigned long long init_addr;
+	unsigned long mapped_addr;
+	unsigned long len;
+	unsigned long prot;
+	unsigned long is_file_backed;
+};
+
+static int lsm_send_to_userspace(struct mapping_info *map_info)
 {
     struct sk_buff *skb;
     void *msg_head;
@@ -114,18 +123,45 @@ static int lsm_send_to_userspace(unsigned long addr, unsigned long len)
         nlmsg_free(skb);
         return -ENOMEM;
     }
-
-    // Add the address attribute to the message
-    ret = nla_put_u64_64bit(skb, LSM_ATTR_ADDRESS, addr, 0);
+    // Add the pid attribute to the message
+    ret = nla_put_u64_64bit(skb, LSM_ATTR_PID, map_info->pid, 0);
     if (ret) {
-        pr_err("LSM: Failed to add address attribute to Netlink message\n");
+        pr_err("LSM: Failed to add pid attribute to Netlink message\n");
         genlmsg_cancel(skb, msg_head);
         nlmsg_free(skb);
         return ret;
     }
-    ret = nla_put_u64_64bit(skb, LSM_ATTR_LENGTH, len, 0);
+    ret = nla_put_u64_64bit(skb, LSM_ATTR_INIT_ADDRESS, map_info->init_addr, 0);
+    if (ret) {
+        pr_err("LSM: Failed to add initial address attribute to Netlink message\n");
+        genlmsg_cancel(skb, msg_head);
+        nlmsg_free(skb);
+        return ret;
+    }
+    ret = nla_put_u64_64bit(skb, LSM_ATTR_ADDRESS, map_info->mapped_addr, 0);
+    if (ret) {
+        pr_err("LSM: Failed to add mapped address attribute to Netlink message\n");
+        genlmsg_cancel(skb, msg_head);
+        nlmsg_free(skb);
+        return ret;
+    }
+    ret = nla_put_u64_64bit(skb, LSM_ATTR_LENGTH, map_info->len, 0);
     if (ret) {
         pr_err("LSM: Failed to add length attribute to Netlink message\n");
+        genlmsg_cancel(skb, msg_head);
+        nlmsg_free(skb);
+        return ret;
+    }
+    ret = nla_put_u64_64bit(skb, LSM_ATTR_PROT, map_info->prot, 0);
+    if (ret) {
+        pr_err("LSM: Failed to add prot attribute to Netlink message\n");
+        genlmsg_cancel(skb, msg_head);
+        nlmsg_free(skb);
+        return ret;
+    }
+    ret = nla_put_u64_64bit(skb, LSM_ATTR_IS_FILE_BACKED, map_info->is_file_backed, 0);
+    if (ret) {
+        pr_err("LSM: Failed to add is_file_backed attribute to Netlink message\n");
         genlmsg_cancel(skb, msg_head);
         nlmsg_free(skb);
         return ret;
@@ -161,6 +197,8 @@ static int mcheck_file_mprotect(struct vm_area_struct *vma, unsigned long reqpro
 
 static struct completion analyzer_mmap_done;
 static struct completion analyzer_munmap_ready;
+
+
 struct mmap_analyzer_thread_data {
     struct mm_struct *analyzer_mm;
     unsigned long len;
@@ -243,9 +281,11 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsign
     }
 
     // we are only interested in file-backed mappings
-    if (!(vma->vm_file)) {
+    // in the case of jitted code, we are actually interested
+    // in annonymous mappings too
+    /*if (!(vma->vm_file)) {
         return 0;
-    }
+    }*/
 
     struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
     if (!analyzer_mm) {
@@ -282,8 +322,16 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsign
         return 0;
     }
 
+	struct mapping_info info = {
+		.pid = current->pid,
+		.init_addr = addr,
+		.mapped_addr = analyzer_data->address,
+		.len = len,
+		.prot = prot,
+		.is_file_backed = vma->vm_file != NULL,
+	};
     // send info to user-space
-    lsm_send_to_userspace(analyzer_data->address, len);
+    lsm_send_to_userspace(&info);
 
     // wait for user-space analysis
     wait_for_completion(&analyzer_ready);
@@ -411,7 +459,15 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len, un
 
     if (remapping_ok) {
         pr_info("mcheck_custom_mprotect_hook: remapping ok\n");
-        lsm_send_to_userspace(analyzer_data->address, len);
+		struct mapping_info info = {
+			.pid = current->pid,
+			.init_addr = addr,
+			.mapped_addr = analyzer_data->address,
+			.len = len,
+			.prot = prot,
+			.is_file_backed = analyzer_vma->vm_file != NULL,
+		};
+        lsm_send_to_userspace(&info);
         wait_for_completion(&analyzer_ready);
         reinit_completion(&analyzer_ready);
     } else {
