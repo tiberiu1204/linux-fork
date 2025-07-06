@@ -493,7 +493,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len, un
 }
 
 #ifdef CONFIG_BPF_SYSCALL
-static int bpf_prog_hook(struct bpf_prog *prog, union bpf_attr *attr, struct bpf_token *token)
+/*static int bpf_prog_hook(struct bpf_prog *prog, union bpf_attr *attr, struct bpf_token *token)
 {
     if (!prog->jited) {
         // only jited programs are interesting
@@ -557,7 +557,7 @@ static int bpf_prog_hook(struct bpf_prog *prog, union bpf_attr *attr, struct bpf
     kfree(analyzer_data);
 
     return -analyzer_response;
-}
+}*/
 #endif
 
 static struct security_hook_list mcheck_hooks[] __ro_after_init = {
@@ -566,7 +566,7 @@ static struct security_hook_list mcheck_hooks[] __ro_after_init = {
     LSM_HOOK_INIT(mmap_addr_size_prot, mcheck_custom_mmap_hook),
     LSM_HOOK_INIT(mprotect_addr_size_prot, mcheck_custom_mprotect_hook),
     #ifdef CONFIG_BPF_SYSCALL
-    LSM_HOOK_INIT(bpf_prog_load, bpf_prog_hook),
+    // LSM_HOOK_INIT(bpf_prog_load, bpf_prog_hook),
     #endif
 };
 
