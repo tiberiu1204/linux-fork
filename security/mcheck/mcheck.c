@@ -18,6 +18,7 @@
 #include <linux/mcheck.h>
 #include <linux/device.h>
 #include <linux/cdev.h>
+#include "socket.c"
 
 #ifdef pr_fmt
 #   undef pr_fmt
