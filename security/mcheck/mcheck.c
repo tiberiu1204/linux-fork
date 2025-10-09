@@ -123,6 +123,8 @@ static ssize_t lsm_receive_reply_tcp(char *buf)
 	if (len < 0) {
 		pr_err("LSM: Unable to receive data over tcp (%ld)\n", len);
 	}
+
+	analyzer_response = *(int *)buf;
 	return len;
 }
 
@@ -137,6 +139,15 @@ struct mapping_info {
 
 static int lsm_send_to_userspace_tcp(char *buf, size_t len)
 {
+	// Initialize connection
+	if (!sock) {
+		sock = _tcp_connect();
+		if (!sock) {
+			pr_err("LSM: Failed to establish TCP connection\n");
+            return -ENOTCONN;
+		}
+	}
+
     int ret;
 
     if (!buf || len == 0) {
@@ -310,6 +321,46 @@ static int mmap_analyzer_thread(void *arg) {
 static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsigned long prot)
 {
     // pr_info("mcheck_custom_mmap_hook: addr = %lx, len = %lx, prot = %lx\n", addr, len, prot);
+	
+	if (use_tcp) {
+        if (!addr || !len) {
+            pr_err("LSM: Invalid buffer or length for TCP send\n");
+            return -EINVAL;
+        }
+
+        unsigned long pages_no = (len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+        struct page **pages = kmalloc(sizeof(struct page*) * pages_no, GFP_KERNEL);
+        if (!pages) {
+            pr_err("LSM: Failed to allocate page array\n");
+            return -ENOMEM;
+        }
+
+        int pinned = get_user_pages(addr, pages_no, FOLL_FORCE | FOLL_WRITE, pages);
+        if (pinned <= 0) {
+            pr_err("LSM: Failed to pin pages\n");
+            kfree(pages);
+            return -EFAULT;
+        }
+
+        for (int i = 0; i < pinned; i++) {
+            void *kaddr = kmap(pages[i]);
+            size_t chunk_size = (i == pinned - 1) ? (len - i * PAGE_SIZE) : PAGE_SIZE;
+            lsm_send_to_userspace_tcp(kaddr, chunk_size);
+            kunmap(pages[i]);
+            put_page(pages[i]);
+        }
+
+        kfree(pages);
+
+		char buf[16];
+		ssize_t len = lsm_receive_reply_tcp(buf);
+		if (len < 0) {
+			pr_err("LSM: Failed to receive analyzer reply");
+			return -EINVAL;
+		}
+		
+        return -analyzer_response;  // Early exit, skip analyzer mapping
+    }
 
     // analyzer task is not set yet
     if (!analyzer_task) {
