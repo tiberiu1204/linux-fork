@@ -4,11 +4,13 @@
 #include "linux/mm_types.h"
 #include "linux/mman.h"
 #include "linux/mmap_lock.h"
+#include "linux/net.h"
 #include "linux/printk.h"
 #include "linux/sched.h"
 #include "linux/sched/mm.h"
 #include "linux/spinlock.h"
 #include "linux/timekeeping.h"
+#include "vdso/page.h"
 #include <linux/security.h>
 #include <linux/export.h>
 #include <linux/lsm_hooks.h>
@@ -25,12 +27,19 @@
 #endif
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt "\n"
 
+// Module param to switch between netlink and tcp socket transport methods
+
+static bool use_tcp = true;
+module_param(use_tcp, bool, 0644);
+MODULE_PARM_DESC(use_tcp, "Send messages to userspace via a TCP socket");
+
+static struct socket *sock = NULL;
+
 int init_char_device(void);
 
 static struct task_struct *analyzer_task = NULL;
 static unsigned int analyzer_response = 0;
 static struct completion analyzer_ready;
-
 
 // Attribute policy (validation)
 static struct nla_policy lsm_policy[LSM_ATTR_MAX + 1] = {
@@ -95,6 +104,28 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 	return 0;
 }
 
+// Function to handle user-space replies using the tcp socket
+
+
+static ssize_t lsm_receive_reply_tcp(char *buf)
+{
+	// Initialize connection
+	if (!sock) {
+		sock = _tcp_connect();
+		if (!sock) {
+			pr_err("LSM: Failed to establish TCP connection\n");
+            return -ENOTCONN;
+		}
+	}
+
+	// Receive
+	ssize_t len = _tcp_recv(sock, buf, 1024);
+	if (len < 0) {
+		pr_err("LSM: Unable to receive data over tcp (%ld)\n", len);
+	}
+	return len;
+}
+
 struct mapping_info {
 	unsigned long pid;
 	unsigned long long init_addr;
@@ -103,6 +134,27 @@ struct mapping_info {
 	unsigned long prot;
 	unsigned long is_file_backed;
 };
+
+static int lsm_send_to_userspace_tcp(char *buf, size_t len)
+{
+    int ret;
+
+    if (!buf || len == 0) {
+        pr_err("LSM: Invalid buffer or length\n");
+        return -EINVAL;
+    }
+
+    ret = _tcp_send(sock, (char *)buf, len);
+    if (ret < 0) {
+        pr_err("LSM: Failed to send data via TCP (%d)\n", ret);
+    } else {
+        pr_info("LSM: Sent %d bytes to userspace via TCP\n", ret);
+    }
+
+    sock_release(sock);
+
+    return ret;
+}
 
 static int lsm_send_to_userspace(struct mapping_info *map_info)
 {
@@ -254,7 +306,6 @@ static int mmap_analyzer_thread(void *arg) {
     }
     return 0;
 }
-
 
 static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsigned long prot)
 {

@@ -111,7 +111,7 @@ static ssize_t __attribute__((unused)) _tcp_recv(struct socket *sock, char *buf,
 		rb = kernel_recvmsg(sock, &msg, &vec, 1, vec.iov_len, 0);
 		if (rb == -ERESTARTSYS || rb == -EAGAIN)
 			continue;
-		RET(rb < 0, -1, "unable to send data (%ld)", rb);
+		RET(rb < 0, -1, "unable to receive data (%ld)", rb);
 
 		vec.iov_base += rb;
 		vec.iov_len -= rb;
