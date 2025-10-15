@@ -29,7 +29,7 @@
 
 // Module param to switch between netlink and tcp socket transport methods
 
-static bool use_tcp = true;
+static bool use_tcp = false;
 module_param(use_tcp, bool, 0644);
 MODULE_PARM_DESC(use_tcp, "Send messages to userspace via a TCP socket");
 
@@ -78,7 +78,7 @@ static struct genl_family lsm_family = {
 static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 {
     if (!info->attrs[LSM_ATTR_RESPONSE]) {
-        pr_err("LSM: No response received!\n");
+        pr_err("No response received!\n");
         return -EINVAL;
     }
 
@@ -107,26 +107,26 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 // Function to handle user-space replies using the tcp socket
 
 
-static ssize_t lsm_receive_reply_tcp(char *buf)
-{
-	// Initialize connection
-	if (!sock) {
-		sock = _tcp_connect();
-		if (!sock) {
-			pr_err("LSM: Failed to establish TCP connection\n");
-            return -ENOTCONN;
-		}
-	}
-
-	// Receive
-	ssize_t len = _tcp_recv(sock, buf, 1024);
-	if (len < 0) {
-		pr_err("LSM: Unable to receive data over tcp (%ld)\n", len);
-	}
-
-	analyzer_response = *(int *)buf;
-	return len;
-}
+// static ssize_t lsm_receive_reply_tcp(char *buf)
+// {
+// 	// Initialize connection
+// 	if (!sock) {
+// 		sock = _tcp_connect();
+// 		if (!sock) {
+// 			pr_err("LSM: Failed to establish TCP connection\n");
+//             return -ENOTCONN;
+// 		}
+// 	}
+// 
+// 	// Receive
+// 	ssize_t len = _tcp_recv(sock, buf, 1024);
+// 	if (len < 0) {
+// 		pr_err("LSM: Unable to receive data over tcp (%ld)\n", len);
+// 	}
+// 
+// 	analyzer_response = *(int *)buf;
+// 	return len;
+// }
 
 struct mapping_info {
 	unsigned long pid;
@@ -137,32 +137,37 @@ struct mapping_info {
 	unsigned long is_file_backed;
 };
 
-static int lsm_send_to_userspace_tcp(char *buf, size_t len)
+static int lsm_init_tcp_connection(void)
 {
-	// Initialize connection
-	if (!sock) {
-		sock = _tcp_connect();
-		if (!sock) {
-			pr_err("LSM: Failed to establish TCP connection\n");
-            return -ENOTCONN;
-		}
+	if (sock) {
+		return 0;
 	}
 
+	sock = _tcp_connect();
+	if (!sock) {
+		// pr_err("Failed to establish TCP connection\n");
+		return -ENOTCONN;
+	}
+
+	pr_info("TCP connection established successfully\n");
+	return 0;
+}
+
+static int lsm_send_to_userspace_tcp(char *buf, size_t len)
+{
     int ret;
 
     if (!buf || len == 0) {
-        pr_err("LSM: Invalid buffer or length\n");
+        pr_err("Invalid buffer or length\n");
         return -EINVAL;
     }
 
     ret = _tcp_send(sock, (char *)buf, len);
     if (ret < 0) {
-        pr_err("LSM: Failed to send data via TCP (%d)\n", ret);
+        pr_err("Failed to send data via TCP (%d)\n", ret);
     } else {
-        pr_info("LSM: Sent %d bytes to userspace via TCP\n", ret);
+        pr_info("Sent %d bytes to userspace via TCP\n", ret);
     }
-
-    sock_release(sock);
 
     return ret;
 }
@@ -323,10 +328,20 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsign
     // pr_info("mcheck_custom_mmap_hook: addr = %lx, len = %lx, prot = %lx\n", addr, len, prot);
 	
 	if (use_tcp) {
+		if (!sock) {
+			if (lsm_init_tcp_connection() != 0) {
+				// server cannot be reached, return 0
+				return 0;
+			}
+		}
         if (!addr || !len) {
             pr_err("LSM: Invalid buffer or length for TCP send\n");
             return -EINVAL;
         }
+		// we are only interested in executable mappings
+		if (!(prot & PROT_EXEC)) {
+    	    return 0;
+    	}
 
         unsigned long pages_no = (len + PAGE_SIZE - 1) >> PAGE_SHIFT;
         struct page **pages = kmalloc(sizeof(struct page*) * pages_no, GFP_KERNEL);
@@ -342,22 +357,51 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len, unsign
             return -EFAULT;
         }
 
-        for (int i = 0; i < pinned; i++) {
-            void *kaddr = kmap(pages[i]);
-            size_t chunk_size = (i == pinned - 1) ? (len - i * PAGE_SIZE) : PAGE_SIZE;
-            lsm_send_to_userspace_tcp(kaddr, chunk_size);
-            kunmap(pages[i]);
-            put_page(pages[i]);
-        }
+		struct vm_area_struct *vma = find_vma(current->mm, addr);
+		if (!vma) {
+    	    pr_err("mcheck_custom_mmap_hook: failed to find vma\n");
+    	    return -EINVAL;
+    	}
+
+       for (int i = 0; i < pinned; i++) {
+			void *kaddr = kmap(pages[i]);
+    		size_t chunk_size = (i == pinned - 1) ? (len - i * PAGE_SIZE) : PAGE_SIZE;
+
+    		struct mapping_info info = {
+    		    .pid = current->pid,
+    		    .init_addr = addr + i * PAGE_SIZE,  
+    		    .mapped_addr = 0,                   
+    		    .len = chunk_size,                  
+    		    .prot = prot,                       
+    		    .is_file_backed = vma->vm_file != NULL,                
+    		};
+
+    		char *buf = kmalloc(sizeof(info) + PAGE_SIZE, GFP_KERNEL);
+			if (!buf) {
+				pr_err("mcheck_custom_mmap_hook: kmalloc failed\n");
+				return -ENOMEM;
+			}
+
+    		memcpy(buf, &info, sizeof(info));
+    		memcpy(buf + sizeof(info), kaddr, chunk_size);
+
+    		lsm_send_to_userspace_tcp(buf, sizeof(info) + chunk_size);
+
+    		kunmap(pages[i]);
+    		put_page(pages[i]);
+			kfree(buf);
+		}
+
+		pr_info("LSM: Sent %ld pages to userspace\n", pages_no);
 
         kfree(pages);
 
-		char buf[16];
-		ssize_t len = lsm_receive_reply_tcp(buf);
-		if (len < 0) {
-			pr_err("LSM: Failed to receive analyzer reply");
-			return -EINVAL;
-		}
+		// char buf[16];
+		// ssize_t len = lsm_receive_reply_tcp(buf);
+		// if (len < 0) {
+		// 	pr_err("LSM: Failed to receive analyzer reply");
+		// 	return -EINVAL;
+		// }
 		
         return -analyzer_response;  // Early exit, skip analyzer mapping
     }

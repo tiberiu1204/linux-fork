@@ -35,7 +35,7 @@
  ******************************************************************************/
 
 static uint16_t server_port = 9999;
-static const char *server_ip = "127.0.0.1";
+static const char *server_ip = "10.0.2.2";
 
 static struct socket *_tcp_connect(void)
 {
@@ -43,11 +43,8 @@ static struct socket *_tcp_connect(void)
 	struct sockaddr_in addr; /* server address */
 	struct socket *sock; /* TCP socket     */
 
-	sock = kmalloc(sizeof(*sock), GFP_KERNEL);
-	RET(!sock, NULL, "unable to allocate memory for socket");
-
 	ans = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
-	GOTO(ans < 0, clean_alloc, "unable to create TCP socket");
+	GOTO(ans < 0, exit, "unable to create TCP socket");
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
@@ -57,17 +54,16 @@ static struct socket *_tcp_connect(void)
 
 	ans = sock->ops->connect(sock, (struct sockaddr *)&addr, sizeof(addr),
 				 O_RDWR);
-	GOTO(ans && ans != -EINPROGRESS, clean_socket, "unable to connect (%d)",
-	     ans);
+	if (ans && ans != -EINPROGRESS) {
+		goto clean_socket;
+	}
 
 	return sock;
 
 clean_socket:
 	sock_release(sock);
 
-clean_alloc:
-	kfree(sock);
-
+exit:
 	return NULL;
 }
 
