@@ -1,3 +1,5 @@
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt "\n"
+
 #include "asm-generic/errno-base.h"
 #include "linux/completion.h"
 #include <linux/vmalloc.h>      /* vmap                  */
@@ -24,10 +26,6 @@
 #include <linux/cdev.h>
 #include "socket.c"
 
-#ifdef pr_fmt
-#undef pr_fmt
-#endif
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt "\n"
 
 // Module param to switch between netlink and tcp socket transport methods
 
@@ -80,19 +78,19 @@ static struct genl_family lsm_family = {
 static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 {
 	if (!info->attrs[LSM_ATTR_RESPONSE]) {
-		pr_err("No response received!\n");
+		pr_err("No response received!");
 		return -EINVAL;
 	}
 
 	int user_response = (int)nla_get_s32(info->attrs[LSM_ATTR_RESPONSE]);
-	pr_info("LSM: Received response from user-space: %d\n", user_response);
+	pr_info("LSM: Received response from user-space: %d", user_response);
 
 	// register the analyzer task
 	if (!analyzer_task) {
-		pr_info("LSM: Received analyzer PID: %d\n", user_response);
+		pr_info("LSM: Received analyzer PID: %d", user_response);
 		analyzer_task = find_task_by_vpid(user_response);
 		if (!analyzer_task) {
-			pr_err("LSM: Failed to find analyzer task\n");
+			pr_err("LSM: Failed to find analyzer task");
 			return -EINVAL;
 		}
 		init_char_device();
@@ -114,7 +112,7 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 // 	if (!sock) {
 // 		sock = _tcp_connect();
 // 		if (!sock) {
-// 			pr_err("LSM: Failed to establish TCP connection\n");
+// 			pr_err("LSM: Failed to establish TCP connection");
 //             return -ENOTCONN;
 // 		}
 // 	}
@@ -122,7 +120,7 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 // 	// Receive
 // 	ssize_t len = _tcp_recv(sock, buf, 1024);
 // 	if (len < 0) {
-// 		pr_err("LSM: Unable to receive data over tcp (%ld)\n", len);
+// 		pr_err("LSM: Unable to receive data over tcp (%ld)", len);
 // 	}
 //
 // 	analyzer_response = *(int *)buf;
@@ -130,6 +128,7 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 // }
 
 struct mapping_info {
+	char name[TASK_COMM_LEN];
 	unsigned long pid;
 	unsigned long long init_addr;
 	unsigned long mapped_addr;
@@ -146,11 +145,11 @@ static int lsm_init_tcp_connection(void)
 
 	sock = _tcp_connect();
 	if (!sock) {
-		// pr_err("Failed to establish TCP connection\n");
+		// pr_err("Failed to establish TCP connection");
 		return -ENOTCONN;
 	}
 
-	pr_info("TCP connection established successfully\n");
+	pr_info("TCP connection established successfully");
 	return 0;
 }
 
@@ -159,15 +158,15 @@ static int lsm_send_to_userspace_tcp(char *buf, size_t len)
 	int ret;
 
 	if (!buf || len == 0) {
-		pr_err("Invalid buffer or length\n");
+		pr_err("Invalid buffer or length");
 		return -EINVAL;
 	}
 
 	ret = _tcp_send(sock, (char *)buf, len);
 	if (ret < 0) {
-		pr_err("Failed to send data via TCP (%d)\n", ret);
+		pr_err("Failed to send data via TCP (%d)", ret);
 	} else {
-		pr_info("Sent %d bytes to userspace via TCP\n", ret);
+		pr_info("Sent %d bytes to userspace via TCP", ret);
 	}
 
 	return ret;
@@ -182,21 +181,21 @@ static int lsm_send_to_userspace(struct mapping_info *map_info)
 	// Allocate a new Netlink message
 	skb = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
 	if (!skb) {
-		pr_err("LSM: Failed to allocate new Netlink message\n");
+		pr_err("LSM: Failed to allocate new Netlink message");
 		return -ENOMEM;
 	}
 
 	// Create the message header
 	msg_head = genlmsg_put(skb, 0, 0, &lsm_family, 0, LSM_CMD_NOTIFY);
 	if (!msg_head) {
-		pr_err("LSM: Failed to create Netlink message header\n");
+		pr_err("LSM: Failed to create Netlink message header");
 		nlmsg_free(skb);
 		return -ENOMEM;
 	}
 	// Add the pid attribute to the message
 	ret = nla_put_u64_64bit(skb, LSM_ATTR_PID, map_info->pid, 0);
 	if (ret) {
-		pr_err("LSM: Failed to add pid attribute to Netlink message\n");
+		pr_err("LSM: Failed to add pid attribute to Netlink message");
 		genlmsg_cancel(skb, msg_head);
 		nlmsg_free(skb);
 		return ret;
@@ -204,7 +203,7 @@ static int lsm_send_to_userspace(struct mapping_info *map_info)
 	ret = nla_put_u64_64bit(skb, LSM_ATTR_INIT_ADDRESS, map_info->init_addr,
 				0);
 	if (ret) {
-		pr_err("LSM: Failed to add initial address attribute to Netlink message\n");
+		pr_err("LSM: Failed to add initial address attribute to Netlink message");
 		genlmsg_cancel(skb, msg_head);
 		nlmsg_free(skb);
 		return ret;
@@ -212,21 +211,21 @@ static int lsm_send_to_userspace(struct mapping_info *map_info)
 	ret = nla_put_u64_64bit(skb, LSM_ATTR_ADDRESS, map_info->mapped_addr,
 				0);
 	if (ret) {
-		pr_err("LSM: Failed to add mapped address attribute to Netlink message\n");
+		pr_err("LSM: Failed to add mapped address attribute to Netlink message");
 		genlmsg_cancel(skb, msg_head);
 		nlmsg_free(skb);
 		return ret;
 	}
 	ret = nla_put_u64_64bit(skb, LSM_ATTR_LENGTH, map_info->len, 0);
 	if (ret) {
-		pr_err("LSM: Failed to add length attribute to Netlink message\n");
+		pr_err("LSM: Failed to add length attribute to Netlink message");
 		genlmsg_cancel(skb, msg_head);
 		nlmsg_free(skb);
 		return ret;
 	}
 	ret = nla_put_u64_64bit(skb, LSM_ATTR_PROT, map_info->prot, 0);
 	if (ret) {
-		pr_err("LSM: Failed to add prot attribute to Netlink message\n");
+		pr_err("LSM: Failed to add prot attribute to Netlink message");
 		genlmsg_cancel(skb, msg_head);
 		nlmsg_free(skb);
 		return ret;
@@ -234,7 +233,7 @@ static int lsm_send_to_userspace(struct mapping_info *map_info)
 	ret = nla_put_u64_64bit(skb, LSM_ATTR_IS_FILE_BACKED,
 				map_info->is_file_backed, 0);
 	if (ret) {
-		pr_err("LSM: Failed to add is_file_backed attribute to Netlink message\n");
+		pr_err("LSM: Failed to add is_file_backed attribute to Netlink message");
 		genlmsg_cancel(skb, msg_head);
 		nlmsg_free(skb);
 		return ret;
@@ -246,12 +245,12 @@ static int lsm_send_to_userspace(struct mapping_info *map_info)
 	// Send the message
 	ret = genlmsg_multicast(&lsm_family, skb, 0, 0, GFP_KERNEL);
 	if (ret == -ESRCH) {
-		pr_warn("multicast message sent, but nobody was listening...\n");
+		pr_warn("multicast message sent, but nobody was listening...");
 	} else if (ret) {
-		pr_err("failed to send multicast genl message; ret = %d\n",
+		pr_err("failed to send multicast genl message; ret = %d",
 		       ret);
 	} else {
-		pr_info("multicast message sent\n");
+		pr_info("multicast message sent");
 	}
 
 	return ret;
@@ -259,14 +258,14 @@ static int lsm_send_to_userspace(struct mapping_info *map_info)
 
 static int mcheck_mmap_addr(unsigned long addr)
 {
-	// pr_info("mcheck_mmap_addr: addr = %lx\n", addr);
+	// pr_info("mcheck_mmap_addr: addr = %lx", addr);
 	// lsm_send_address(addr);
 	return 0;
 }
 static int mcheck_file_mprotect(struct vm_area_struct *vma,
 				unsigned long reqprot, unsigned long prot)
 {
-	//pr_info("mcheck_file_mprotect: start = %lx, size = %lx, reqprot = %lx, prot = %lx\n", vma->vm_start, vma->vm_end - vma->vm_start, reqprot, prot);
+	//pr_info("mcheck_file_mprotect: start = %lx, size = %lx, reqprot = %lx, prot = %lx", vma->vm_start, vma->vm_end - vma->vm_start, reqprot, prot);
 	return 0;
 }
 
@@ -305,7 +304,7 @@ static int mmap_analyzer_thread(void *arg)
 			int res = copy_to_user((void __user *)data->address,
 					       data->init_data, data->len);
 			if (res) {
-				pr_err("mcheck_custom_mmap_hook: failed to copy data to user\n");
+				pr_err("mcheck_custom_mmap_hook: failed to copy data to user");
 				vm_munmap(data->address, data->len);
 				data->address = 0;
 			}
@@ -316,14 +315,14 @@ static int mmap_analyzer_thread(void *arg)
 	complete(&analyzer_mmap_done);
 
 	if (!data->address) {
-		pr_err("mcheck_custom_mmap_hook: failed to map file\n");
+		pr_err("mcheck_custom_mmap_hook: failed to map file");
 		while (!kthread_should_stop()) {
 			schedule();
 		}
 		return -ENOMEM;
 	}
 
-	pr_info("mapped address: %lx\n", data->address);
+	pr_info("mapped address: %lx", data->address);
 	wait_for_completion(&analyzer_munmap_ready);
 
 	vm_munmap(data->address, data->len);
@@ -345,7 +344,7 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 		}
 	}
 	if (!addr || !len) {
-		pr_err("LSM: Invalid buffer or length for TCP send\n");
+		pr_err("LSM: Invalid buffer or length for TCP send");
 		return -EINVAL;
 	}
 	// we are only interested in executable mappings
@@ -357,26 +356,26 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 	struct page **pages =
 		kmalloc(sizeof(struct page *) * pages_no, GFP_KERNEL);
 	if (!pages) {
-		pr_err("LSM: Failed to allocate page array\n");
+		pr_err("LSM: Failed to allocate page array");
 		return -ENOMEM;
 	}
 
 	int pinned =
 		get_user_pages(addr, pages_no, FOLL_FORCE | FOLL_WRITE, pages);
 	if (pinned <= 0) {
-		pr_err("Failed to pin pages\n");
+		pr_err("Failed to pin pages");
 		kfree(pages);
 		return -EFAULT;
 	}
 	if (pinned < pages_no) {
-		pr_err("Failed to pin all pages\n");
+		pr_err("Failed to pin all pages");
 		kfree(pages);
 		return -EFAULT;
 	}
 
 	struct vm_area_struct *vma = find_vma(current->mm, addr);
 	if (!vma) {
-		pr_err("mcheck_custom_mmap_hook: failed to find vma\n");
+		pr_err("mcheck_custom_mmap_hook: failed to find vma");
 		return -EINVAL;
 	}
 
@@ -388,20 +387,22 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 		.prot = prot,
 		.is_file_backed = vma->vm_file != NULL,
 	};
+	memcpy(info.name, current->comm, TASK_COMM_LEN);
+	pr_info("Is file backed: %d", vma->vm_file != NULL);
 	char *buf = kmalloc(sizeof(info), GFP_KERNEL);
 	memcpy(buf, &info, sizeof(info));
 
 	void *kaddr = vmap(pages, pinned, VM_MAP, PAGE_KERNEL_RO);
 	if(!kaddr) {
-		pr_err("Unable to map pages into kernel va space\n");
+		pr_err("Unable to map pages into kernel va space");
 		return -ENOMEM;
 	}
 
 
-	pr_info("Sending %ld bytes to userspace via tcp\n", len);
+	pr_info("Sending %ld bytes to userspace via tcp", len);
 	lsm_send_to_userspace_tcp(buf, sizeof(info));
 	lsm_send_to_userspace_tcp(kaddr, pinned * PAGE_SIZE);
-	pr_info("Sent %ld pages to userspace\n", pages_no);
+	pr_info("Sent %ld pages to userspace", pages_no);
 	
 	kfree(buf);
 	vfree(kaddr);
@@ -422,7 +423,7 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 				   unsigned long prot)
 {
-	// pr_info("mcheck_custom_mmap_hook: addr = %lx, len = %lx, prot = %lx\n", addr, len, prot);
+	// pr_info("mcheck_custom_mmap_hook: addr = %lx, len = %lx, prot = %lx", addr, len, prot);
 
 	if (use_tcp) {
 		return send_pages_to_userspace_tcp(addr, len, prot);
@@ -445,7 +446,7 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 
 	struct vm_area_struct *vma = find_vma(current->mm, addr);
 	if (!vma) {
-		pr_err("mcheck_custom_mmap_hook: failed to find vma\n");
+		pr_err("mcheck_custom_mmap_hook: failed to find vma");
 		return -EINVAL;
 	}
 
@@ -458,14 +459,14 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 
 	struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
 	if (!analyzer_mm) {
-		pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm\n");
+		pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm");
 		return -EINVAL;
 	}
 
 	struct mmap_analyzer_thread_data *analyzer_data =
 		kmalloc(sizeof(struct mmap_analyzer_thread_data), GFP_KERNEL);
 	if (!analyzer_data) {
-		pr_err("mcheck_custom_mmap_hook: failed to allocate memory\n");
+		pr_err("mcheck_custom_mmap_hook: failed to allocate memory");
 		return -ENOMEM;
 	}
 	analyzer_data->analyzer_mm = analyzer_mm;
@@ -479,14 +480,14 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 		mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
 
 	if (IS_ERR(task)) {
-		pr_err("Failed to create kernel thread: %ld\n", PTR_ERR(task));
+		pr_err("Failed to create kernel thread: %ld", PTR_ERR(task));
 		kfree(analyzer_data);
 		return 0;
 	}
 
 	wait_for_completion(&analyzer_mmap_done);
 	if (!analyzer_data->address) {
-		pr_err("mcheck_custom_mmap_hook: failed to map file\n");
+		pr_err("mcheck_custom_mmap_hook: failed to map file");
 		kthread_stop(task);
 		mmput(analyzer_mm);
 		kfree(analyzer_data);
@@ -501,6 +502,7 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 		.prot = prot,
 		.is_file_backed = vma->vm_file != NULL,
 	};
+	memcpy(info.name, current->comm, TASK_COMM_LEN);
 	// send info to user-space
 	lsm_send_to_userspace(&info);
 
@@ -521,7 +523,7 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 				       unsigned long prot)
 {
-	//pr_info("mcheck_custom_mprotect_hook: addr = %lx, len = %lx, prot = %lx\n", addr, len, prot);
+	// pr_info("mcheck_custom_mprotect_hook: addr = %lx, len = %lx, prot = %c%c%c", addr, len, prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
 	if (use_tcp) {
 		return send_pages_to_userspace_tcp(addr, len, prot);
 	}
@@ -544,14 +546,14 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 	// alloc memory in analyzer's address space
 	struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
 	if (!analyzer_mm) {
-		pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm\n");
+		pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm");
 		return -EINVAL;
 	}
 
 	struct mmap_analyzer_thread_data *analyzer_data =
 		kmalloc(sizeof(struct mmap_analyzer_thread_data), GFP_KERNEL);
 	if (!analyzer_data) {
-		pr_err("mcheck_custom_mmap_hook: failed to allocate memory\n");
+		pr_err("mcheck_custom_mmap_hook: failed to allocate memory");
 		return -ENOMEM;
 	}
 	analyzer_data->analyzer_mm = analyzer_mm;
@@ -565,7 +567,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 		mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
 
 	if (IS_ERR(task)) {
-		pr_err("Failed to create kernel thread: %ld\n", PTR_ERR(task));
+		pr_err("Failed to create kernel thread: %ld", PTR_ERR(task));
 		kfree(analyzer_data);
 		return 0;
 	}
@@ -575,28 +577,28 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 	struct page **pages =
 		kmalloc(sizeof(struct page *) * pages_no, GFP_KERNEL);
 	if (!pages) {
-		pr_err("mcheck_custom_mprotect_hook: failed to allocate memory\n");
+		pr_err("mcheck_custom_mprotect_hook: failed to allocate memory");
 		return -ENOMEM;
 	}
 
-	pr_info("try to pin %lu pages\n", pages_no);
+	pr_info("try to pin %lu pages", pages_no);
 
 	// mmap_lock already acquired in mprotect!
 	int pinned_pages = get_user_pages(addr, pages_no, FOLL_FORCE, pages);
 	if (pinned_pages < 0) {
-		pr_err("mcheck_custom_mprotect_hook: failed to pin pages\n");
+		pr_err("mcheck_custom_mprotect_hook: failed to pin pages");
 		kfree(pages);
 		return -ENOMEM;
 	}
 
-	pr_info("pinning ok : pages_no = %lu, pinned_pages = %d\n", pages_no,
+	pr_info("pinning ok : pages_no = %lu, pinned_pages = %d", pages_no,
 		pinned_pages);
 
 	// memory allocation in analyzer's address space is done
 	wait_for_completion(&analyzer_mmap_done);
 
 	if (!analyzer_data->address) {
-		pr_err("mcheck_custom_mprotect_hook: failed to mmap in analyzer\n");
+		pr_err("mcheck_custom_mprotect_hook: failed to mmap in analyzer");
 		// unpin pages
 		for (int i = 0; i < pinned_pages; i++) {
 			put_page(pages[i]);
@@ -617,7 +619,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 	// copy-on-write mappings are a special case, we don't need to write so we clear the flag
 	vm_flags_clear(analyzer_vma, VM_MAYWRITE);
 	if (!analyzer_vma) {
-		pr_err("mcheck_custom_mprotect_hook: failed to find vma\n");
+		pr_err("mcheck_custom_mprotect_hook: failed to find vma");
 		remapping_ok = 0;
 	}
 	for (int i = 0; i < pinned_pages; i++) {
@@ -633,7 +635,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 			analyzer_vma, analyzer_data->address + i * PAGE_SIZE,
 			pfn, size, analyzer_vma->vm_page_prot);
 		if (ret) {
-			pr_err("mcheck_custom_mprotect_hook: remap_pfn_range err = %d; i = %d\n",
+			pr_err("mcheck_custom_mprotect_hook: remap_pfn_range err = %d; i = %d",
 			       ret, i);
 			remapping_ok = 0;
 		}
@@ -641,7 +643,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 	mmap_write_unlock(analyzer_mm);
 
 	if (remapping_ok) {
-		pr_info("mcheck_custom_mprotect_hook: remapping ok\n");
+		pr_info("mcheck_custom_mprotect_hook: remapping ok");
 		struct mapping_info info = {
 			.pid = current->pid,
 			.init_addr = addr,
@@ -650,11 +652,12 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 			.prot = prot,
 			.is_file_backed = analyzer_vma->vm_file != NULL,
 		};
+		memcpy(info.name, current->comm, TASK_COMM_LEN);
 		lsm_send_to_userspace(&info);
 		wait_for_completion(&analyzer_ready);
 		reinit_completion(&analyzer_ready);
 	} else {
-		pr_err("mcheck_custom_mprotect_hook: remapping failed\n");
+		pr_err("mcheck_custom_mprotect_hook: remapping failed");
 	}
 
 	// unmap memory from analyzer
@@ -683,7 +686,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
         return 0;
     }
     if (!prog->bpf_func) {
-        pr_err("bpf_prog_hook: prog bpf_func is NULL\n");
+        pr_err("bpf_prog_hook: prog bpf_func is NULL");
         return 0;
     }
 
@@ -694,13 +697,13 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 
     struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
     if (!analyzer_mm) {
-        pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm\n");
+        pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm");
         return -EINVAL;
     }
 
     struct mmap_analyzer_thread_data *analyzer_data = kmalloc(sizeof(struct mmap_analyzer_thread_data), GFP_KERNEL);
     if (!analyzer_data) {
-        pr_err("mcheck_custom_mmap_hook: failed to allocate memory\n");
+        pr_err("mcheck_custom_mmap_hook: failed to allocate memory");
         return -ENOMEM;
     }
     analyzer_data->analyzer_mm = analyzer_mm;
@@ -712,14 +715,14 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
     init_completion(&analyzer_mmap_done);
     struct task_struct *task = kthread_run(mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
     if (IS_ERR(task)) {
-        pr_err("Failed to create kernel thread: %ld\n", PTR_ERR(task));
+        pr_err("Failed to create kernel thread: %ld", PTR_ERR(task));
         kfree(analyzer_data);
         return 0;
     }
     wait_for_completion(&analyzer_mmap_done);
 
     if (!analyzer_data->address) {
-        pr_err("mcheck_custom_mmap_hook: failed to mmap in analyzer\n");
+        pr_err("mcheck_custom_mmap_hook: failed to mmap in analyzer");
         kthread_stop(task);
         kfree(analyzer_data);
         return 0;
@@ -765,12 +768,12 @@ static int __init mcheck_lsm_init(void)
 
 	int ret = genl_register_family(&lsm_family);
 	if (ret) {
-		pr_err("LSM: Failed to register Netlink family\n");
+		pr_err("LSM: Failed to register Netlink family");
 		return ret;
 	}
 
 	init_completion(&analyzer_ready);
-	pr_info("MCHECK: LSM initialized\n");
+	pr_info("MCHECK: LSM initialized");
 	return 0;
 }
 
@@ -906,7 +909,7 @@ int init_char_device(void)
 		goto err_class_destroy;
 	}
 
-	pr_info("Performance char device initialized\n");
+	pr_info("Performance char device initialized");
 	return 0;
 
 err_class_destroy:
@@ -969,16 +972,16 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 		if (!mmap_relevant) {
 			return;
 		}
-		// pr_info("mcheck_custom_mmap_hook: elapsed time = %llu ns\n", mmap_hook_end_time - mmap_hook_start_time);
+		// pr_info("mcheck_custom_mmap_hook: elapsed time = %llu ns", mmap_hook_end_time - mmap_hook_start_time);
 
 		char temp_buffer[64];
 		int len = snprintf(temp_buffer, sizeof(temp_buffer),
-				   "mmap,mmap_hook,%llu,%llu\n",
+				   "mmap,mmap_hook,%llu,%llu",
 				   mmap_hook_counter,
 				   mmap_hook_end_time - mmap_hook_start_time);
 
 		perfchar_write(temp_buffer, len);
-		pr_info("exiting in_mmap_hook = %d\n", in_mmap_hook);
+		pr_info("exiting in_mmap_hook = %d", in_mmap_hook);
 		mmap_hook_counter++;
 	} else if (this_fn == mcheck_custom_mprotect_hook) {
 		uint64_t mprotect_hook_end_time = ktime_get_ns();
@@ -986,11 +989,11 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 		if (!mprotect_relevant) {
 			return;
 		}
-		// pr_info("mcheck_custom_mprotect_hook: elapsed time = %llu ns\n", mprotect_hook_end_time - mprotect_hook_start_time);
+		// pr_info("mcheck_custom_mprotect_hook: elapsed time = %llu ns", mprotect_hook_end_time - mprotect_hook_start_time);
 
 		char temp_buffer[64];
 		int len = snprintf(temp_buffer, sizeof(temp_buffer),
-				   "mprotect,mprotect_hook,%llu,%llu\n",
+				   "mprotect,mprotect_hook,%llu,%llu",
 				   mprotect_hook_counter,
 				   mprotect_hook_end_time -
 					   mprotect_hook_start_time);
@@ -999,10 +1002,10 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 		mprotect_hook_counter++;
 	} else if (this_fn == lsm_send_to_userspace) {
 		uint64_t lsm_send_to_userspace_end_time = ktime_get_ns();
-		pr_info("lsm_send_to_userspace: elapsed time = %llu ns\n",
+		pr_info("lsm_send_to_userspace: elapsed time = %llu ns",
 			lsm_send_to_userspace_end_time -
 				lsm_send_to_userspace_start_time);
-		pr_info("in_mmap_hook = %d, in_mprotect_hook = %d\n",
+		pr_info("in_mmap_hook = %d, in_mprotect_hook = %d",
 			in_mmap_hook, in_mprotect_hook);
 
 		char temp_buffer[64];
@@ -1012,7 +1015,7 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 			mmap_relevant = 1;
 			len = snprintf(
 				temp_buffer, sizeof(temp_buffer),
-				"mmap,lsm_send_to_userspace,%llu,%llu\n",
+				"mmap,lsm_send_to_userspace,%llu,%llu",
 				mmap_hook_counter,
 				lsm_send_to_userspace_end_time -
 					lsm_send_to_userspace_start_time);
@@ -1020,7 +1023,7 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 			mprotect_relevant = 1;
 			len = snprintf(
 				temp_buffer, sizeof(temp_buffer),
-				"mprotect,lsm_send_to_userspace,%llu,%llu\n",
+				"mprotect,lsm_send_to_userspace,%llu,%llu",
 				mprotect_hook_counter,
 				lsm_send_to_userspace_end_time -
 					lsm_send_to_userspace_start_time);
@@ -1032,20 +1035,20 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 			return;
 		}
 		uint64_t lsm_receive_reply_end_time = ktime_get_ns();
-		// pr_info("lsm_receive_reply: elapsed time = %llu ns\n", lsm_receive_reply_end_time - lsm_receive_reply_start_time);
+		// pr_info("lsm_receive_reply: elapsed time = %llu ns", lsm_receive_reply_end_time - lsm_receive_reply_start_time);
 
 		char temp_buffer[64];
 		int len = 0;
 
 		if (in_mmap_hook) {
 			len = snprintf(temp_buffer, sizeof(temp_buffer),
-				       "mmap,lsm_receive_reply,%llu,%llu\n",
+				       "mmap,lsm_receive_reply,%llu,%llu",
 				       mmap_hook_counter,
 				       lsm_receive_reply_end_time -
 					       lsm_receive_reply_start_time);
 		} else if (in_mprotect_hook) {
 			len = snprintf(temp_buffer, sizeof(temp_buffer),
-				       "mprotect,lsm_receive_reply,%llu,%llu\n",
+				       "mprotect,lsm_receive_reply,%llu,%llu",
 				       mprotect_hook_counter,
 				       lsm_receive_reply_end_time -
 					       lsm_receive_reply_start_time);
@@ -1054,21 +1057,21 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 		perfchar_write(temp_buffer, len);
 	} else if (this_fn == mmap_analyzer_thread) {
 		uint64_t mmap_analyzer_thread_end_time = ktime_get_ns();
-		// pr_info("mmap_analyzer_thread: elapsed time = %llu ns\n", mmap_analyzer_thread_end_time - mmap_analyzer_thread_start_time);
+		// pr_info("mmap_analyzer_thread: elapsed time = %llu ns", mmap_analyzer_thread_end_time - mmap_analyzer_thread_start_time);
 
 		char temp_buffer[64];
 		int len = 0;
 
 		if (in_mmap_hook) {
 			len = snprintf(temp_buffer, sizeof(temp_buffer),
-				       "mmap,mmap_analyzer_thread,%llu,%llu\n",
+				       "mmap,mmap_analyzer_thread,%llu,%llu",
 				       mmap_hook_counter,
 				       mmap_analyzer_thread_end_time -
 					       mmap_analyzer_thread_start_time);
 		} else if (in_mprotect_hook) {
 			len = snprintf(
 				temp_buffer, sizeof(temp_buffer),
-				"mprotect,mmap_analyzer_thread,%llu,%llu\n",
+				"mprotect,mmap_analyzer_thread,%llu,%llu",
 				mprotect_hook_counter,
 				mmap_analyzer_thread_end_time -
 					mmap_analyzer_thread_start_time);
