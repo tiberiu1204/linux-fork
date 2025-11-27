@@ -2,7 +2,7 @@
 
 #include "asm-generic/errno-base.h"
 #include "linux/completion.h"
-#include <linux/vmalloc.h>      /* vmap                  */
+#include <linux/vmalloc.h> /* vmap                  */
 #include "linux/kthread.h"
 #include "linux/mm.h"
 #include "linux/mm_types.h"
@@ -26,6 +26,10 @@
 #include <linux/cdev.h>
 #include "socket.c"
 
+enum syscall {
+	SYSCALL_MMAP,
+	SYSCALL_MPROTECT
+};
 
 // Module param to switch between netlink and tcp socket transport methods
 
@@ -247,8 +251,7 @@ static int lsm_send_to_userspace(struct mapping_info *map_info)
 	if (ret == -ESRCH) {
 		pr_warn("multicast message sent, but nobody was listening...");
 	} else if (ret) {
-		pr_err("failed to send multicast genl message; ret = %d",
-		       ret);
+		pr_err("failed to send multicast genl message; ret = %d", ret);
 	} else {
 		pr_info("multicast message sent");
 	}
@@ -335,7 +338,7 @@ static int mmap_analyzer_thread(void *arg)
 }
 
 static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
-				       unsigned long prot)
+				       unsigned long prot, enum syscall caller)
 {
 	if (!sock) {
 		if (lsm_init_tcp_connection() != 0) {
@@ -347,6 +350,13 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 		pr_err("LSM: Invalid buffer or length for TCP send");
 		return -EINVAL;
 	}
+	
+	if (caller == SYSCALL_MPROTECT) {
+		pr_info("mcheck_custom_mprotect_hook: addr = %lx, len = %lx, prot = %c%c%c", addr, len, prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
+	} else if (caller == SYSCALL_MMAP) {
+		pr_info("mcheck_custom_mmap_hook: addr = %lx, len = %lx, prot = %c%c%c", addr, len, prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
+	}
+
 	// we are only interested in executable mappings
 	if (!(prot & PROT_EXEC)) {
 		return 0;
@@ -363,7 +373,7 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 	int pinned =
 		get_user_pages(addr, pages_no, FOLL_FORCE | FOLL_WRITE, pages);
 	if (pinned <= 0) {
-		pr_err("Failed to pin pages");
+		pr_err("Failed to pin pages (%d)", pinned);
 		kfree(pages);
 		return -EFAULT;
 	}
@@ -377,6 +387,11 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 	if (!vma) {
 		pr_err("mcheck_custom_mmap_hook: failed to find vma");
 		return -EINVAL;
+	}
+
+	// We are only interested in anonymous mappings
+	if (vma->vm_file) {
+		return 0;
 	}
 
 	struct mapping_info info = {
@@ -393,20 +408,19 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 	memcpy(buf, &info, sizeof(info));
 
 	void *kaddr = vmap(pages, pinned, VM_MAP, PAGE_KERNEL_RO);
-	if(!kaddr) {
+	if (!kaddr) {
 		pr_err("Unable to map pages into kernel va space");
 		return -ENOMEM;
 	}
-
 
 	pr_info("Sending %ld bytes to userspace via tcp", len);
 	lsm_send_to_userspace_tcp(buf, sizeof(info));
 	lsm_send_to_userspace_tcp(kaddr, pinned * PAGE_SIZE);
 	pr_info("Sent %ld pages to userspace", pages_no);
-	
+
 	kfree(buf);
 	vfree(kaddr);
-	for(int i = 0; i < pinned; i++)
+	for (int i = 0; i < pinned; i++)
 		put_page(pages[i]);
 	kfree(pages);
 
@@ -423,10 +437,8 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 				   unsigned long prot)
 {
-	// pr_info("mcheck_custom_mmap_hook: addr = %lx, len = %lx, prot = %lx", addr, len, prot);
-
 	if (use_tcp) {
-		return send_pages_to_userspace_tcp(addr, len, prot);
+		return send_pages_to_userspace_tcp(addr, len, prot, SYSCALL_MMAP);
 	}
 
 	// analyzer task is not set yet
@@ -450,12 +462,10 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 		return -EINVAL;
 	}
 
-	// we are only interested in file-backed mappings
-	// in the case of jitted code, we are actually interested
-	// in annonymous mappings too
-	/*if (!(vma->vm_file)) {
-        return 0;
-    }*/
+	// We are only interested in anonymous mappings
+	if (vma->vm_file) {
+		return 0;
+	}
 
 	struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
 	if (!analyzer_mm) {
@@ -523,9 +533,8 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 				       unsigned long prot)
 {
-	// pr_info("mcheck_custom_mprotect_hook: addr = %lx, len = %lx, prot = %c%c%c", addr, len, prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
 	if (use_tcp) {
-		return send_pages_to_userspace_tcp(addr, len, prot);
+		return send_pages_to_userspace_tcp(addr, len, prot, SYSCALL_MPROTECT);
 	}
 
 	// analyzer task is not set yet
@@ -622,6 +631,12 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 		pr_err("mcheck_custom_mprotect_hook: failed to find vma");
 		remapping_ok = 0;
 	}
+
+	// We are only interested in anonymous mappings
+	if (analyzer_vma->vm_file) {
+		return 0;
+	}
+
 	for (int i = 0; i < pinned_pages; i++) {
 		if (!remapping_ok) {
 			break;
