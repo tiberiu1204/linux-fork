@@ -2,11 +2,12 @@
 
 #include "asm-generic/errno-base.h"
 #include "linux/completion.h"
-#include <linux/vmalloc.h> /* vmap                  */
+#include <linux/vmalloc.h> /* vmap		          */
 #include "linux/kthread.h"
 #include "linux/mm.h"
 #include "linux/mm_types.h"
 #include "linux/mman.h"
+#include "linux/pagewalk.h"
 #include "linux/mmap_lock.h"
 #include "linux/net.h"
 #include "linux/printk.h"
@@ -117,7 +118,7 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 // 		sock = _tcp_connect();
 // 		if (!sock) {
 // 			pr_err("LSM: Failed to establish TCP connection");
-//             return -ENOTCONN;
+//		     return -ENOTCONN;
 // 		}
 // 	}
 //
@@ -305,7 +306,7 @@ static int mmap_analyzer_thread(void *arg)
 		}
 		if (data->address && data->init_data) {
 			int res = copy_to_user((void __user *)data->address,
-					       data->init_data, data->len);
+						   data->init_data, data->len);
 			if (res) {
 				pr_err("mcheck_custom_mmap_hook: failed to copy data to user");
 				vm_munmap(data->address, data->len);
@@ -337,103 +338,168 @@ static int mmap_analyzer_thread(void *arg)
 	return 0;
 }
 
-static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
-				       unsigned long prot, enum syscall caller)
+/* Initial size for the page array */
+#define INITIAL_CAPACITY 512 
+
+struct walk_ctx {
+	struct page **pages;		/* dynamic array of page pointers	*/
+	unsigned long capacity;   	/* current array size			*/
+	unsigned long count;	  	/* current number of pages collected	*/
+	unsigned long batch_start_addr;	/* start address of batch		*/
+	bool memory_error;	    	/* flag if we failed to grow		*/
+	struct mapping_info *info; 	/* mapping matadata			*/
+};
+
+static void flush_accumulated_pages(struct walk_ctx *ctx)
 {
-	if (!sock) {
-		if (lsm_init_tcp_connection() != 0) {
-			// server cannot be reached, return 0
-			return 0;
-		}
+	if (ctx->count == 0) return;
+
+	void *kaddr;
+	unsigned long data_len = ctx->count * PAGE_SIZE;
+	struct mapping_info info = *ctx->info;
+
+	kaddr = vmap(ctx->pages, ctx->count, VM_MAP, PAGE_KERNEL_RO);
+	
+	if (kaddr) {
+		info.len = data_len;
+		info.init_addr = ctx->batch_start_addr;
+		char *buf = kmalloc(sizeof(info), GFP_KERNEL);
+		memcpy(buf, &info, sizeof(info));
+
+		lsm_send_to_userspace_tcp(buf, sizeof(info));
+		lsm_send_to_userspace_tcp(kaddr, data_len);
+
+		vunmap(kaddr);
+		kfree(buf);
+	} else {
+		pr_err("LSM: Failed to vmap %lu pages\n", ctx->count);
 	}
-	if (!addr || !len) {
-		pr_err("LSM: Invalid buffer or length for TCP send");
-		return -EINVAL;
+
+	for (int i = 0; i < ctx->count; i++) {
+		put_page(ctx->pages[i]);
+	}
+
+	ctx->count = 0;
+}
+
+static int grow_page_array(struct walk_ctx *ctx)
+{
+	unsigned long new_cap = ctx->capacity * 2;
+	struct page **new_pages;
+
+	new_pages = kvrealloc(ctx->pages, 
+		                  sizeof(struct page *) * new_cap, 
+		                  GFP_KERNEL);
+
+	if (!new_pages) {
+		pr_err("LSM: Failed to grow page array to %lu slots\n", new_cap);
+		ctx->memory_error = true;
+		return -ENOMEM;
+	}
+
+	ctx->pages = new_pages;
+	ctx->capacity = new_cap;
+	return 0;
+}
+
+static int collect_pages(pte_t *pte, unsigned long addr,
+		                 unsigned long next, struct mm_walk *walk)
+{
+	struct walk_ctx *ctx = walk->private;
+	struct page *page;
+	pte_t ptent = *pte;
+
+	if (ctx->memory_error) return -ENOMEM;
+
+	if (!pte_present(ptent) || is_zero_pfn(pte_pfn(ptent))) {
+		flush_accumulated_pages(ctx);
+		return 0;
+	}
+
+	unsigned long pfn = pte_pfn(ptent);
+	if (!pfn_valid(pfn)) {
+		flush_accumulated_pages(ctx);
+		return 0;
 	}
 	
+	if (ctx->count >= ctx->capacity) {
+		if (grow_page_array(ctx) != 0) {
+		    flush_accumulated_pages(ctx);
+		}
+	}
+
+	page = pfn_to_page(pfn);
+	get_page(page);
+	ctx->pages[ctx->count++] = page;
+
+	if (ctx->count == 1) {
+		ctx->batch_start_addr = addr;
+	}
+
+	return 0;
+}
+
+static int collect_pmd(pmd_t *pmd, unsigned long addr,
+		               unsigned long next, struct mm_walk *walk)
+{
+	/* Huge pages will be processed 4KB at a time by collect_pages */
+	return 0; 
+}
+
+static int handle_hole(unsigned long addr, unsigned long next, int depth,
+		               struct mm_walk *walk)
+{
+	flush_accumulated_pages((struct walk_ctx *)walk->private);
+	return 0;
+}
+
+static const struct mm_walk_ops lsm_walk_ops = {
+	.pte_entry = collect_pages,
+	.pmd_entry = collect_pmd,   // Just descends
+	.pte_hole  = handle_hole,   // Flushes
+};
+
+static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
+		                               unsigned long prot, enum syscall caller)
+{
+	struct vm_area_struct *vma;
+	struct walk_ctx ctx = {0};
+
+	if (!sock && lsm_init_tcp_connection() != 0) return 0;
+	if (!addr || !len) return -EINVAL;
+	if (!(prot & PROT_EXEC)) return 0;
+
+	vma = find_vma(current->mm, addr);
+	if (!vma || vma->vm_file) return 0;
 	if (caller == SYSCALL_MPROTECT) {
 		pr_info("mcheck_custom_mprotect_hook: addr = %lx, len = %lx, prot = %c%c%c", addr, len, prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
 	} else if (caller == SYSCALL_MMAP) {
 		pr_info("mcheck_custom_mmap_hook: addr = %lx, len = %lx, prot = %c%c%c", addr, len, prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
 	}
 
-	// we are only interested in executable mappings
-	if (!(prot & PROT_EXEC)) {
-		return 0;
-	}
-
-	unsigned long pages_no = (len + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	struct page **pages =
-		kmalloc(sizeof(struct page *) * pages_no, GFP_KERNEL);
-	if (!pages) {
-		pr_err("LSM: Failed to allocate page array");
-		return -ENOMEM;
-	}
-
-	int pinned =
-		get_user_pages(addr, pages_no, FOLL_FORCE | FOLL_WRITE, pages);
-	if (pinned <= 0) {
-		pr_err("Failed to pin pages (%d)", pinned);
-		kfree(pages);
-		return -EFAULT;
-	}
-	if (pinned < pages_no) {
-		pr_err("Failed to pin all pages");
-		kfree(pages);
-		return -EFAULT;
-	}
-
-	struct vm_area_struct *vma = find_vma(current->mm, addr);
-	if (!vma) {
-		pr_err("mcheck_custom_mmap_hook: failed to find vma");
-		return -EINVAL;
-	}
-
-	// We are only interested in anonymous mappings
-	if (vma->vm_file) {
-		return 0;
-	}
+	ctx.capacity = INITIAL_CAPACITY;
+	ctx.pages = kvmalloc_array(ctx.capacity, sizeof(struct page *), GFP_KERNEL);
+	if (!ctx.pages) return -ENOMEM;
 
 	struct mapping_info info = {
 		.pid = current->pid,
 		.init_addr = addr,
 		.mapped_addr = 0,
-		.len = len,
+		.len = 0,
 		.prot = prot,
 		.is_file_backed = vma->vm_file != NULL,
 	};
 	memcpy(info.name, current->comm, TASK_COMM_LEN);
-	pr_info("Is file backed: %d", vma->vm_file != NULL);
-	char *buf = kmalloc(sizeof(info), GFP_KERNEL);
-	memcpy(buf, &info, sizeof(info));
 
-	void *kaddr = vmap(pages, pinned, VM_MAP, PAGE_KERNEL_RO);
-	if (!kaddr) {
-		pr_err("Unable to map pages into kernel va space");
-		return -ENOMEM;
-	}
+	ctx.info = &info;
+	walk_page_range(current->mm, addr, addr + len, &lsm_walk_ops, &ctx);
+	flush_accumulated_pages(&ctx);
 
-	pr_info("Sending %ld bytes to userspace via tcp", len);
-	lsm_send_to_userspace_tcp(buf, sizeof(info));
-	lsm_send_to_userspace_tcp(kaddr, pinned * PAGE_SIZE);
-	pr_info("Sent %ld pages to userspace", pages_no);
+	kvfree(ctx.pages);
 
-	kfree(buf);
-	vfree(kaddr);
-	for (int i = 0; i < pinned; i++)
-		put_page(pages[i]);
-	kfree(pages);
-
-	// char buf[16];
-	// ssize_t len = lsm_receive_reply_tcp(buf);
-	// if (len < 0) {
-	// 	pr_err("LSM: Failed to receive analyzer reply");
-	// 	return -EINVAL;
-	// }
-
+	if (ctx.memory_error) return -ENOMEM;
 	return -analyzer_response;
 }
-
 static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 				   unsigned long prot)
 {
@@ -531,7 +597,7 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 }
 
 static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
-				       unsigned long prot)
+					   unsigned long prot)
 {
 	if (use_tcp) {
 		return send_pages_to_userspace_tcp(addr, len, prot, SYSCALL_MPROTECT);
@@ -651,7 +717,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 			pfn, size, analyzer_vma->vm_page_prot);
 		if (ret) {
 			pr_err("mcheck_custom_mprotect_hook: remap_pfn_range err = %d; i = %d",
-			       ret, i);
+				   ret, i);
 			remapping_ok = 0;
 		}
 	}
@@ -696,68 +762,68 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 #ifdef CONFIG_BPF_SYSCALL
 /*static int bpf_prog_hook(struct bpf_prog *prog, union bpf_attr *attr, struct bpf_token *token)
 {
-    if (!prog->jited) {
-        // only jited programs are interesting
-        return 0;
-    }
-    if (!prog->bpf_func) {
-        pr_err("bpf_prog_hook: prog bpf_func is NULL");
-        return 0;
-    }
+	if (!prog->jited) {
+		// only jited programs are interesting
+		return 0;
+	}
+	if (!prog->bpf_func) {
+		pr_err("bpf_prog_hook: prog bpf_func is NULL");
+		return 0;
+	}
 
-    // analyzer task is not set yet
-    if (!analyzer_task) {
-        return 0;
-    }
+	// analyzer task is not set yet
+	if (!analyzer_task) {
+		return 0;
+	}
 
-    struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
-    if (!analyzer_mm) {
-        pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm");
-        return -EINVAL;
-    }
+	struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
+	if (!analyzer_mm) {
+		pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm");
+		return -EINVAL;
+	}
 
-    struct mmap_analyzer_thread_data *analyzer_data = kmalloc(sizeof(struct mmap_analyzer_thread_data), GFP_KERNEL);
-    if (!analyzer_data) {
-        pr_err("mcheck_custom_mmap_hook: failed to allocate memory");
-        return -ENOMEM;
-    }
-    analyzer_data->analyzer_mm = analyzer_mm;
-    analyzer_data->len = prog->jited_len;
-    analyzer_data->vma = NULL;
-    analyzer_data->address = 0;
-    analyzer_data->init_data = prog->bpf_func;
+	struct mmap_analyzer_thread_data *analyzer_data = kmalloc(sizeof(struct mmap_analyzer_thread_data), GFP_KERNEL);
+	if (!analyzer_data) {
+		pr_err("mcheck_custom_mmap_hook: failed to allocate memory");
+		return -ENOMEM;
+	}
+	analyzer_data->analyzer_mm = analyzer_mm;
+	analyzer_data->len = prog->jited_len;
+	analyzer_data->vma = NULL;
+	analyzer_data->address = 0;
+	analyzer_data->init_data = prog->bpf_func;
 
-    init_completion(&analyzer_mmap_done);
-    struct task_struct *task = kthread_run(mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
-    if (IS_ERR(task)) {
-        pr_err("Failed to create kernel thread: %ld", PTR_ERR(task));
-        kfree(analyzer_data);
-        return 0;
-    }
-    wait_for_completion(&analyzer_mmap_done);
+	init_completion(&analyzer_mmap_done);
+	struct task_struct *task = kthread_run(mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
+	if (IS_ERR(task)) {
+		pr_err("Failed to create kernel thread: %ld", PTR_ERR(task));
+		kfree(analyzer_data);
+		return 0;
+	}
+	wait_for_completion(&analyzer_mmap_done);
 
-    if (!analyzer_data->address) {
-        pr_err("mcheck_custom_mmap_hook: failed to mmap in analyzer");
-        kthread_stop(task);
-        kfree(analyzer_data);
-        return 0;
-    }
+	if (!analyzer_data->address) {
+		pr_err("mcheck_custom_mmap_hook: failed to mmap in analyzer");
+		kthread_stop(task);
+		kfree(analyzer_data);
+		return 0;
+	}
 
-    // send info to user-space
-    lsm_send_to_userspace(analyzer_data->address, prog->jited_len);
+	// send info to user-space
+	lsm_send_to_userspace(analyzer_data->address, prog->jited_len);
 
-    // wait for user-space analysis
-    wait_for_completion(&analyzer_ready);
-    reinit_completion(&analyzer_ready);
+	// wait for user-space analysis
+	wait_for_completion(&analyzer_ready);
+	reinit_completion(&analyzer_ready);
 
-    // ready to unmap file
-    complete(&analyzer_munmap_ready);
+	// ready to unmap file
+	complete(&analyzer_munmap_ready);
 
-    kthread_stop(task);
-    mmput(analyzer_mm);
-    kfree(analyzer_data);
+	kthread_stop(task);
+	mmput(analyzer_mm);
+	kfree(analyzer_data);
 
-    return -analyzer_response;
+	return -analyzer_response;
 }*/
 #endif
 
@@ -810,7 +876,7 @@ static size_t perf_buf_tail = 0;
 static DEFINE_SPINLOCK(perf_lock);
 
 static ssize_t perfchar_read(struct file *filep, char __user *buf, size_t len,
-			     loff_t *offset)
+				 loff_t *offset)
 {
 	ssize_t ret = 0;
 
@@ -846,8 +912,8 @@ static ssize_t perfchar_read(struct file *filep, char __user *buf, size_t len,
 
 		if (copy_to_user(buf, perf_buffer + perf_buf_tail,
 				 first_part) != 0 ||
-		    copy_to_user(buf + first_part, perf_buffer, second_part) !=
-			    0) {
+			copy_to_user(buf + first_part, perf_buffer, second_part) !=
+				0) {
 			spin_unlock(&perf_lock);
 			return -EFAULT;
 		}
@@ -1057,16 +1123,16 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 
 		if (in_mmap_hook) {
 			len = snprintf(temp_buffer, sizeof(temp_buffer),
-				       "mmap,lsm_receive_reply,%llu,%llu",
-				       mmap_hook_counter,
-				       lsm_receive_reply_end_time -
-					       lsm_receive_reply_start_time);
+					   "mmap,lsm_receive_reply,%llu,%llu",
+					   mmap_hook_counter,
+					   lsm_receive_reply_end_time -
+						   lsm_receive_reply_start_time);
 		} else if (in_mprotect_hook) {
 			len = snprintf(temp_buffer, sizeof(temp_buffer),
-				       "mprotect,lsm_receive_reply,%llu,%llu",
-				       mprotect_hook_counter,
-				       lsm_receive_reply_end_time -
-					       lsm_receive_reply_start_time);
+					   "mprotect,lsm_receive_reply,%llu,%llu",
+					   mprotect_hook_counter,
+					   lsm_receive_reply_end_time -
+						   lsm_receive_reply_start_time);
 		}
 
 		perfchar_write(temp_buffer, len);
@@ -1079,10 +1145,10 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 
 		if (in_mmap_hook) {
 			len = snprintf(temp_buffer, sizeof(temp_buffer),
-				       "mmap,mmap_analyzer_thread,%llu,%llu",
-				       mmap_hook_counter,
-				       mmap_analyzer_thread_end_time -
-					       mmap_analyzer_thread_start_time);
+					   "mmap,mmap_analyzer_thread,%llu,%llu",
+					   mmap_hook_counter,
+					   mmap_analyzer_thread_end_time -
+						   mmap_analyzer_thread_start_time);
 		} else if (in_mprotect_hook) {
 			len = snprintf(
 				temp_buffer, sizeof(temp_buffer),
