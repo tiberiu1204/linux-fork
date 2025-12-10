@@ -135,8 +135,8 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 struct mapping_info {
 	char name[TASK_COMM_LEN];
 	unsigned long pid;
-	unsigned long long init_addr;
-	unsigned long mapped_addr;
+	unsigned long init_addr;
+	unsigned long mapped_addr; /* when sending via tcp, will use this as offset */
 	unsigned long len;
 	unsigned long prot;
 	unsigned long is_file_backed;
@@ -345,7 +345,6 @@ struct walk_ctx {
 	struct page **pages;		/* dynamic array of page pointers	*/
 	unsigned long capacity;   	/* current array size			*/
 	unsigned long count;	  	/* current number of pages collected	*/
-	unsigned long batch_start_addr;	/* start address of batch		*/
 	bool memory_error;	    	/* flag if we failed to grow		*/
 	struct mapping_info *info; 	/* mapping matadata			*/
 };
@@ -362,7 +361,6 @@ static void flush_accumulated_pages(struct walk_ctx *ctx)
 	
 	if (kaddr) {
 		info.len = data_len;
-		info.init_addr = ctx->batch_start_addr;
 		char *buf = kmalloc(sizeof(info), GFP_KERNEL);
 		memcpy(buf, &info, sizeof(info));
 
@@ -431,9 +429,9 @@ static int collect_pages(pte_t *pte, unsigned long addr,
 	page = pfn_to_page(pfn);
 	get_page(page);
 	ctx->pages[ctx->count++] = page;
-
 	if (ctx->count == 1) {
-		ctx->batch_start_addr = addr;
+		/* using mapped_addr field as offset */
+		ctx->info->mapped_addr = addr - ctx->info->init_addr; 
 	}
 
 	return 0;
@@ -485,7 +483,7 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 		.pid = current->pid,
 		.init_addr = addr,
 		.mapped_addr = 0,
-		.len = 0,
+		.len = len,
 		.prot = prot,
 		.is_file_backed = vma->vm_file != NULL,
 	};
