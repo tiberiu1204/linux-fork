@@ -27,10 +27,10 @@
 #include <linux/cdev.h>
 #include "socket.c"
 
-enum syscall {
-	SYSCALL_MMAP,
-	SYSCALL_MPROTECT
-};
+enum syscall { SYSCALL_MMAP, SYSCALL_MPROTECT };
+enum tcp_send_status { SKIPPED, ANALYSIS_PENDING };
+
+
 
 // Module param to switch between netlink and tcp socket transport methods
 
@@ -111,26 +111,17 @@ static int lsm_receive_reply(struct sk_buff *skb, struct genl_info *info)
 
 // Function to handle user-space replies using the tcp socket
 
-// static ssize_t lsm_receive_reply_tcp(char *buf)
-// {
-// 	// Initialize connection
-// 	if (!sock) {
-// 		sock = _tcp_connect();
-// 		if (!sock) {
-// 			pr_err("LSM: Failed to establish TCP connection");
-//		     return -ENOTCONN;
-// 		}
-// 	}
-//
-// 	// Receive
-// 	ssize_t len = _tcp_recv(sock, buf, 1024);
-// 	if (len < 0) {
-// 		pr_err("LSM: Unable to receive data over tcp (%ld)", len);
-// 	}
-//
-// 	analyzer_response = *(int *)buf;
-// 	return len;
-// }
+static ssize_t lsm_receive_reply_tcp(char *buf)
+{
+	// Receive
+	ssize_t len = _tcp_recv(sock, buf, 4);
+	if (len < 0) {
+		pr_err("LSM: Unable to receive data over tcp (%ld)", len);
+	}
+
+	analyzer_response = *(int *)buf;
+	return len;
+}
 
 struct mapping_info {
 	char name[TASK_COMM_LEN];
@@ -353,24 +344,33 @@ struct walk_ctx {
 
 static void flush_accumulated_pages(struct walk_ctx *ctx)
 {
-	if (ctx->count == 0) return;
+	if (ctx->count == 0 && !ctx->info->is_end_of_mapping) return;
 
-	void *kaddr;
+	void *kaddr = NULL;
 	unsigned long data_len = ctx->count * PAGE_SIZE;
 	struct mapping_info info = *ctx->info;
 
-	kaddr = vmap(ctx->pages, ctx->count, VM_MAP, PAGE_KERNEL_RO);
+	if (ctx->count > 0) {
+		kaddr = vmap(ctx->pages, ctx->count, VM_MAP, PAGE_KERNEL_RO);
+	}
 	
-	if (kaddr) {
+	if (kaddr || ctx->count == 0) {
 		info.len = data_len;
 		char *buf = kmalloc(sizeof(info), GFP_KERNEL);
-		memcpy(buf, &info, sizeof(info));
+		if (buf) {
+			memcpy(buf, &info, sizeof(info));
 
-		lsm_send_to_userspace_tcp(buf, sizeof(info));
-		lsm_send_to_userspace_tcp(kaddr, data_len);
+			// Send header
+			lsm_send_to_userspace_tcp(buf, sizeof(info));
 
-		vunmap(kaddr);
-		kfree(buf);
+			// Send data only if it is not empty
+			if (kaddr) {
+				lsm_send_to_userspace_tcp(kaddr, data_len);
+			}
+
+			kfree(buf);
+		}
+		if (kaddr) vunmap(kaddr);
 	} else {
 		pr_err("LSM: Failed to vmap %lu pages\n", ctx->count);
 	}
@@ -465,12 +465,12 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 	struct vm_area_struct *vma;
 	struct walk_ctx ctx = {0};
 
-	if (!sock && lsm_init_tcp_connection() != 0) return 0;
+	if (!sock && lsm_init_tcp_connection() != 0) return SKIPPED;
 	if (!addr || !len) return -EINVAL;
-	if (!(prot & PROT_EXEC)) return 0;
+	if (!(prot & PROT_EXEC)) return SKIPPED;
 
 	vma = find_vma(current->mm, addr);
-	if (!vma || vma->vm_file) return 0;
+	if (!vma || vma->vm_file) return SKIPPED;
 	if (caller == SYSCALL_MPROTECT) {
 		pr_info("mcheck_custom_mprotect_hook: addr = %lx, len = %lx, prot = %c%c%c", addr, len, prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
 	} else if (caller == SYSCALL_MMAP) {
@@ -501,13 +501,22 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 	kvfree(ctx.pages);
 
 	if (ctx.memory_error) return -ENOMEM;
-	return -analyzer_response;
+	return ANALYSIS_PENDING;
 }
 static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 				   unsigned long prot)
 {
 	if (use_tcp) {
-		return send_pages_to_userspace_tcp(addr, len, prot, SYSCALL_MMAP);
+		int ret = send_pages_to_userspace_tcp(addr, len, prot, SYSCALL_MMAP);
+		if (ret == SKIPPED || ret < 0) {
+			return 0;
+		}
+		char buf[4];
+		ssize_t len = lsm_receive_reply_tcp(buf);
+		if (len < 4) {
+			return 0;
+		}
+		return -analyzer_response;
 	}
 
 	// analyzer task is not set yet
@@ -603,7 +612,16 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 					   unsigned long prot)
 {
 	if (use_tcp) {
-		return send_pages_to_userspace_tcp(addr, len, prot, SYSCALL_MPROTECT);
+		int ret = send_pages_to_userspace_tcp(addr, len, prot, SYSCALL_MPROTECT);
+		if (ret == SKIPPED || ret < 0) {
+			return 0;
+		}
+		char buf[4];
+		ssize_t len = lsm_receive_reply_tcp(buf);
+		if (len < 4) {
+			return 0;
+		}
+		return -analyzer_response;
 	}
 
 	// analyzer task is not set yet
