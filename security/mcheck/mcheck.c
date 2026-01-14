@@ -137,9 +137,11 @@ struct mapping_info {
 	unsigned long pid;
 	unsigned long init_addr;
 	unsigned long mapped_addr; /* when sending via tcp, will use this as offset */
+	unsigned long mapping_len;
 	unsigned long len;
 	unsigned long prot;
 	unsigned long is_file_backed;
+	unsigned long is_end_of_mapping;
 };
 
 static int lsm_init_tcp_connection(void)
@@ -483,14 +485,17 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 		.pid = current->pid,
 		.init_addr = addr,
 		.mapped_addr = 0,
-		.len = len,
+		.mapping_len = len,
+		.len = 0,
 		.prot = prot,
 		.is_file_backed = vma->vm_file != NULL,
+		.is_end_of_mapping = 0
 	};
 	memcpy(info.name, current->comm, TASK_COMM_LEN);
 
 	ctx.info = &info;
 	walk_page_range(current->mm, addr, addr + len, &lsm_walk_ops, &ctx);
+	ctx.info->is_end_of_mapping = 1; // Mark this as end of transmission
 	flush_accumulated_pages(&ctx);
 
 	kvfree(ctx.pages);
