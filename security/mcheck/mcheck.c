@@ -28,9 +28,7 @@
 #include "socket.c"
 
 enum syscall { SYSCALL_MMAP, SYSCALL_MPROTECT };
-enum tcp_send_status { SKIPPED, ANALYSIS_PENDING };
-
-
+enum tcp_send_status { SKIPPED };
 
 // Module param to switch between netlink and tcp socket transport methods
 
@@ -127,7 +125,8 @@ struct mapping_info {
 	char name[TASK_COMM_LEN];
 	unsigned long pid;
 	unsigned long init_addr;
-	unsigned long mapped_addr; /* when sending via tcp, will use this as offset */
+	unsigned long
+		mapped_addr; /* when sending via tcp, will use this as offset */
 	unsigned long mapping_len;
 	unsigned long len;
 	unsigned long prot;
@@ -299,7 +298,7 @@ static int mmap_analyzer_thread(void *arg)
 		}
 		if (data->address && data->init_data) {
 			int res = copy_to_user((void __user *)data->address,
-						   data->init_data, data->len);
+					       data->init_data, data->len);
 			if (res) {
 				pr_err("mcheck_custom_mmap_hook: failed to copy data to user");
 				vm_munmap(data->address, data->len);
@@ -332,19 +331,20 @@ static int mmap_analyzer_thread(void *arg)
 }
 
 /* Initial size for the page array */
-#define INITIAL_CAPACITY 512 
+#define INITIAL_CAPACITY 512
 
 struct walk_ctx {
-	struct page **pages;		/* dynamic array of page pointers	*/
-	unsigned long capacity;   	/* current array size			*/
-	unsigned long count;	  	/* current number of pages collected	*/
-	bool memory_error;	    	/* flag if we failed to grow		*/
-	struct mapping_info *info; 	/* mapping matadata			*/
+	struct page **pages; /* dynamic array of page pointers	*/
+	unsigned long capacity; /* current array size			*/
+	unsigned long count; /* current number of pages collected	*/
+	bool memory_error; /* flag if we failed to grow		*/
+	struct mapping_info *info; /* mapping matadata			*/
 };
 
 static void flush_accumulated_pages(struct walk_ctx *ctx)
 {
-	if (ctx->count == 0 && !ctx->info->is_end_of_mapping) return;
+	if (ctx->count == 0 && !ctx->info->is_end_of_mapping)
+		return;
 
 	void *kaddr = NULL;
 	unsigned long data_len = ctx->count * PAGE_SIZE;
@@ -353,7 +353,7 @@ static void flush_accumulated_pages(struct walk_ctx *ctx)
 	if (ctx->count > 0) {
 		kaddr = vmap(ctx->pages, ctx->count, VM_MAP, PAGE_KERNEL_RO);
 	}
-	
+
 	if (kaddr || ctx->count == 0) {
 		info.len = data_len;
 		char *buf = kmalloc(sizeof(info), GFP_KERNEL);
@@ -370,7 +370,8 @@ static void flush_accumulated_pages(struct walk_ctx *ctx)
 
 			kfree(buf);
 		}
-		if (kaddr) vunmap(kaddr);
+		if (kaddr)
+			vunmap(kaddr);
 	} else {
 		pr_err("LSM: Failed to vmap %lu pages\n", ctx->count);
 	}
@@ -387,12 +388,12 @@ static int grow_page_array(struct walk_ctx *ctx)
 	unsigned long new_cap = ctx->capacity * 2;
 	struct page **new_pages;
 
-	new_pages = kvrealloc(ctx->pages, 
-		                  sizeof(struct page *) * new_cap, 
-		                  GFP_KERNEL);
+	new_pages = kvrealloc(ctx->pages, sizeof(struct page *) * new_cap,
+			      GFP_KERNEL);
 
 	if (!new_pages) {
-		pr_err("LSM: Failed to grow page array to %lu slots\n", new_cap);
+		pr_err("LSM: Failed to grow page array to %lu slots\n",
+		       new_cap);
 		ctx->memory_error = true;
 		return -ENOMEM;
 	}
@@ -402,14 +403,15 @@ static int grow_page_array(struct walk_ctx *ctx)
 	return 0;
 }
 
-static int collect_pages(pte_t *pte, unsigned long addr,
-		                 unsigned long next, struct mm_walk *walk)
+static int collect_pages(pte_t *pte, unsigned long addr, unsigned long next,
+			 struct mm_walk *walk)
 {
 	struct walk_ctx *ctx = walk->private;
 	struct page *page;
 	pte_t ptent = *pte;
 
-	if (ctx->memory_error) return -ENOMEM;
+	if (ctx->memory_error)
+		return -ENOMEM;
 
 	if (!pte_present(ptent) || is_zero_pfn(pte_pfn(ptent))) {
 		flush_accumulated_pages(ctx);
@@ -421,10 +423,10 @@ static int collect_pages(pte_t *pte, unsigned long addr,
 		flush_accumulated_pages(ctx);
 		return 0;
 	}
-	
+
 	if (ctx->count >= ctx->capacity) {
 		if (grow_page_array(ctx) != 0) {
-		    flush_accumulated_pages(ctx);
+			flush_accumulated_pages(ctx);
 		}
 	}
 
@@ -433,21 +435,21 @@ static int collect_pages(pte_t *pte, unsigned long addr,
 	ctx->pages[ctx->count++] = page;
 	if (ctx->count == 1) {
 		/* using mapped_addr field as offset */
-		ctx->info->mapped_addr = addr - ctx->info->init_addr; 
+		ctx->info->mapped_addr = addr - ctx->info->init_addr;
 	}
 
 	return 0;
 }
 
-static int collect_pmd(pmd_t *pmd, unsigned long addr,
-		               unsigned long next, struct mm_walk *walk)
+static int collect_pmd(pmd_t *pmd, unsigned long addr, unsigned long next,
+		       struct mm_walk *walk)
 {
 	/* Huge pages will be processed 4KB at a time by collect_pages */
-	return 0; 
+	return 0;
 }
 
 static int handle_hole(unsigned long addr, unsigned long next, int depth,
-		               struct mm_walk *walk)
+		       struct mm_walk *walk)
 {
 	flush_accumulated_pages((struct walk_ctx *)walk->private);
 	return 0;
@@ -455,42 +457,52 @@ static int handle_hole(unsigned long addr, unsigned long next, int depth,
 
 static const struct mm_walk_ops lsm_walk_ops = {
 	.pte_entry = collect_pages,
-	.pmd_entry = collect_pmd,   // Just descends
-	.pte_hole  = handle_hole,   // Flushes
+	.pmd_entry = collect_pmd, // Just descends
+	.pte_hole = handle_hole, // Flushes
 };
 
 static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
-		                               unsigned long prot, enum syscall caller)
+				       unsigned long prot, enum syscall caller)
 {
 	struct vm_area_struct *vma;
-	struct walk_ctx ctx = {0};
+	struct walk_ctx ctx = { 0 };
 
-	if (!sock && lsm_init_tcp_connection() != 0) return SKIPPED;
-	if (!addr || !len) return -EINVAL;
-	if (!(prot & PROT_EXEC)) return SKIPPED;
+	if (!sock && lsm_init_tcp_connection() != 0)
+		return SKIPPED;
+	if (!addr || !len)
+		return -EINVAL;
+	if (!(prot & PROT_EXEC))
+		return SKIPPED;
 
 	vma = find_vma(current->mm, addr);
-	if (!vma || vma->vm_file) return SKIPPED;
+	if (!vma || vma->vm_file)
+		return SKIPPED;
 	if (caller == SYSCALL_MPROTECT) {
-		pr_info("mcheck_custom_mprotect_hook: addr = %lx, len = %lx, prot = %c%c%c", addr, len, prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
+		pr_info("mcheck_custom_mprotect_hook: addr = %lx, len = %lx, prot = %c%c%c",
+			addr, len, prot & PROT_READ ? 'r' : '-',
+			prot & PROT_WRITE ? 'w' : '-',
+			prot & PROT_EXEC ? 'x' : '-');
 	} else if (caller == SYSCALL_MMAP) {
-		pr_info("mcheck_custom_mmap_hook: addr = %lx, len = %lx, prot = %c%c%c", addr, len, prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
+		pr_info("mcheck_custom_mmap_hook: addr = %lx, len = %lx, prot = %c%c%c",
+			addr, len, prot & PROT_READ ? 'r' : '-',
+			prot & PROT_WRITE ? 'w' : '-',
+			prot & PROT_EXEC ? 'x' : '-');
 	}
 
 	ctx.capacity = INITIAL_CAPACITY;
-	ctx.pages = kvmalloc_array(ctx.capacity, sizeof(struct page *), GFP_KERNEL);
-	if (!ctx.pages) return -ENOMEM;
+	ctx.pages =
+		kvmalloc_array(ctx.capacity, sizeof(struct page *), GFP_KERNEL);
+	if (!ctx.pages)
+		return -ENOMEM;
 
-	struct mapping_info info = {
-		.pid = current->pid,
-		.init_addr = addr,
-		.mapped_addr = 0,
-		.mapping_len = len,
-		.len = 0,
-		.prot = prot,
-		.is_file_backed = vma->vm_file != NULL,
-		.is_end_of_mapping = 0
-	};
+	struct mapping_info info = { .pid = current->pid,
+				     .init_addr = addr,
+				     .mapped_addr = 0,
+				     .mapping_len = len,
+				     .len = 0,
+				     .prot = prot,
+				     .is_file_backed = vma->vm_file != NULL,
+				     .is_end_of_mapping = 0 };
 	memcpy(info.name, current->comm, TASK_COMM_LEN);
 
 	ctx.info = &info;
@@ -500,23 +512,59 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 
 	kvfree(ctx.pages);
 
-	if (ctx.memory_error) return -ENOMEM;
-	return ANALYSIS_PENDING;
+	if (ctx.memory_error)
+		return -ENOMEM;
+
+	char buf[4];
+	ssize_t reply_len = lsm_receive_reply_tcp(buf);
+	if (reply_len < 4) {
+		return SKIPPED;
+	}
+
+	return -analyzer_response;
 }
+
+static int send_bpf_data_tcp(struct bpf_prog *prog)
+{
+	if (!prog->jited || !prog->bpf_func || prog->jited_len == 0) {
+		return SKIPPED;
+	}
+
+	struct mapping_info info;
+	char buf[4];
+	ssize_t recv_len;
+
+	if (!sock && lsm_init_tcp_connection() != 0)
+		return SKIPPED;
+
+	memset(&info, 0, sizeof(info));
+	info.pid = current->pid;
+	info.init_addr = 0;
+	info.mapped_addr = 0;
+	info.mapping_len = prog->jited_len;
+	info.len = prog->jited_len;
+	info.prot = PROT_READ | PROT_EXEC;
+	info.is_file_backed = 0;
+	info.is_end_of_mapping = 1;
+	memcpy(info.name, current->comm, TASK_COMM_LEN);
+
+	lsm_send_to_userspace_tcp((char *)&info, sizeof(info));
+	lsm_send_to_userspace_tcp((char *)prog->bpf_func, prog->jited_len);
+
+	recv_len = lsm_receive_reply_tcp(buf);
+	if (recv_len < 4) {
+		return SKIPPED;
+	}
+
+	return -analyzer_response;
+}
+
 static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 				   unsigned long prot)
 {
 	if (use_tcp) {
-		int ret = send_pages_to_userspace_tcp(addr, len, prot, SYSCALL_MMAP);
-		if (ret == SKIPPED || ret < 0) {
-			return 0;
-		}
-		char buf[4];
-		ssize_t len = lsm_receive_reply_tcp(buf);
-		if (len < 4) {
-			return 0;
-		}
-		return -analyzer_response;
+		return send_pages_to_userspace_tcp(addr, len, prot,
+						   SYSCALL_MMAP);
 	}
 
 	// analyzer task is not set yet
@@ -609,19 +657,11 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 }
 
 static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
-					   unsigned long prot)
+				       unsigned long prot)
 {
 	if (use_tcp) {
-		int ret = send_pages_to_userspace_tcp(addr, len, prot, SYSCALL_MPROTECT);
-		if (ret == SKIPPED || ret < 0) {
-			return 0;
-		}
-		char buf[4];
-		ssize_t len = lsm_receive_reply_tcp(buf);
-		if (len < 4) {
-			return 0;
-		}
-		return -analyzer_response;
+		return send_pages_to_userspace_tcp(addr, len, prot,
+						   SYSCALL_MPROTECT);
 	}
 
 	// analyzer task is not set yet
@@ -738,7 +778,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 			pfn, size, analyzer_vma->vm_page_prot);
 		if (ret) {
 			pr_err("mcheck_custom_mprotect_hook: remap_pfn_range err = %d; i = %d",
-				   ret, i);
+			       ret, i);
 			remapping_ok = 0;
 		}
 	}
@@ -781,8 +821,12 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 }
 
 #ifdef CONFIG_BPF_SYSCALL
-/*static int bpf_prog_hook(struct bpf_prog *prog, union bpf_attr *attr, struct bpf_token *token)
+static int bpf_prog_hook(struct bpf_prog *prog, union bpf_attr *attr,
+			 struct bpf_token *token)
 {
+	if (use_tcp) {
+		return send_bpf_data_tcp(prog);
+	}
 	if (!prog->jited) {
 		// only jited programs are interesting
 		return 0;
@@ -799,13 +843,14 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 
 	struct mm_struct *analyzer_mm = get_task_mm(analyzer_task);
 	if (!analyzer_mm) {
-		pr_err("mcheck_custom_mmap_hook: failed to get analyzer mm");
+		pr_err("bpf_prog_hook: failed to get analyzer mm");
 		return -EINVAL;
 	}
 
-	struct mmap_analyzer_thread_data *analyzer_data = kmalloc(sizeof(struct mmap_analyzer_thread_data), GFP_KERNEL);
+	struct mmap_analyzer_thread_data *analyzer_data =
+		kmalloc(sizeof(struct mmap_analyzer_thread_data), GFP_KERNEL);
 	if (!analyzer_data) {
-		pr_err("mcheck_custom_mmap_hook: failed to allocate memory");
+		pr_err("bpf_prog_hook: failed to allocate memory");
 		return -ENOMEM;
 	}
 	analyzer_data->analyzer_mm = analyzer_mm;
@@ -815,7 +860,8 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 	analyzer_data->init_data = prog->bpf_func;
 
 	init_completion(&analyzer_mmap_done);
-	struct task_struct *task = kthread_run(mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
+	struct task_struct *task = kthread_run(
+		mmap_analyzer_thread, analyzer_data, "mmap_analyzer_thread");
 	if (IS_ERR(task)) {
 		pr_err("Failed to create kernel thread: %ld", PTR_ERR(task));
 		kfree(analyzer_data);
@@ -824,14 +870,19 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 	wait_for_completion(&analyzer_mmap_done);
 
 	if (!analyzer_data->address) {
-		pr_err("mcheck_custom_mmap_hook: failed to mmap in analyzer");
+		pr_err("bpf_prog_hook: failed to mmap in analyzer");
 		kthread_stop(task);
 		kfree(analyzer_data);
 		return 0;
 	}
 
+	struct mapping_info info = { .pid = current->pid,
+				     .init_addr = 0,
+				     .mapped_addr = analyzer_data->address,
+				     .len = prog->jited_len,
+				     .is_file_backed = 0 };
 	// send info to user-space
-	lsm_send_to_userspace(analyzer_data->address, prog->jited_len);
+	lsm_send_to_userspace(&info);
 
 	// wait for user-space analysis
 	wait_for_completion(&analyzer_ready);
@@ -845,7 +896,7 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 	kfree(analyzer_data);
 
 	return -analyzer_response;
-}*/
+}
 #endif
 
 static struct security_hook_list mcheck_hooks[] __ro_after_init = {
@@ -854,7 +905,7 @@ static struct security_hook_list mcheck_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(mmap_addr_size_prot, mcheck_custom_mmap_hook),
 	LSM_HOOK_INIT(mprotect_addr_size_prot, mcheck_custom_mprotect_hook),
 #ifdef CONFIG_BPF_SYSCALL
-// LSM_HOOK_INIT(bpf_prog_load, bpf_prog_hook),
+	LSM_HOOK_INIT(bpf_prog_load, bpf_prog_hook),
 #endif
 };
 
@@ -897,7 +948,7 @@ static size_t perf_buf_tail = 0;
 static DEFINE_SPINLOCK(perf_lock);
 
 static ssize_t perfchar_read(struct file *filep, char __user *buf, size_t len,
-				 loff_t *offset)
+			     loff_t *offset)
 {
 	ssize_t ret = 0;
 
@@ -933,8 +984,8 @@ static ssize_t perfchar_read(struct file *filep, char __user *buf, size_t len,
 
 		if (copy_to_user(buf, perf_buffer + perf_buf_tail,
 				 first_part) != 0 ||
-			copy_to_user(buf + first_part, perf_buffer, second_part) !=
-				0) {
+		    copy_to_user(buf + first_part, perf_buffer, second_part) !=
+			    0) {
 			spin_unlock(&perf_lock);
 			return -EFAULT;
 		}
@@ -1144,16 +1195,16 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 
 		if (in_mmap_hook) {
 			len = snprintf(temp_buffer, sizeof(temp_buffer),
-					   "mmap,lsm_receive_reply,%llu,%llu",
-					   mmap_hook_counter,
-					   lsm_receive_reply_end_time -
-						   lsm_receive_reply_start_time);
+				       "mmap,lsm_receive_reply,%llu,%llu",
+				       mmap_hook_counter,
+				       lsm_receive_reply_end_time -
+					       lsm_receive_reply_start_time);
 		} else if (in_mprotect_hook) {
 			len = snprintf(temp_buffer, sizeof(temp_buffer),
-					   "mprotect,lsm_receive_reply,%llu,%llu",
-					   mprotect_hook_counter,
-					   lsm_receive_reply_end_time -
-						   lsm_receive_reply_start_time);
+				       "mprotect,lsm_receive_reply,%llu,%llu",
+				       mprotect_hook_counter,
+				       lsm_receive_reply_end_time -
+					       lsm_receive_reply_start_time);
 		}
 
 		perfchar_write(temp_buffer, len);
@@ -1166,10 +1217,10 @@ __cyg_profile_func_exit(void *this_fn, void *call_site)
 
 		if (in_mmap_hook) {
 			len = snprintf(temp_buffer, sizeof(temp_buffer),
-					   "mmap,mmap_analyzer_thread,%llu,%llu",
-					   mmap_hook_counter,
-					   mmap_analyzer_thread_end_time -
-						   mmap_analyzer_thread_start_time);
+				       "mmap,mmap_analyzer_thread,%llu,%llu",
+				       mmap_hook_counter,
+				       mmap_analyzer_thread_end_time -
+					       mmap_analyzer_thread_start_time);
 		} else if (in_mprotect_hook) {
 			len = snprintf(
 				temp_buffer, sizeof(temp_buffer),
