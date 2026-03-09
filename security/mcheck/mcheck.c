@@ -1,3 +1,4 @@
+#include "asm-generic/mman-common.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt "\n"
 
 #include "asm-generic/errno-base.h"
@@ -29,12 +30,18 @@
 
 enum syscall { SYSCALL_MMAP, SYSCALL_MPROTECT };
 enum tcp_send_status { SKIPPED };
+enum { MAX_ARG_LEN = 128, MAX_ANON_NAME = 80 };
 
 // Module param to switch between netlink and tcp socket transport methods
 
 static bool use_tcp = true;
+static char *target_comm = "spidermonkey";
 module_param(use_tcp, bool, 0644);
+module_param(target_comm, charp, 0644);
 MODULE_PARM_DESC(use_tcp, "Send messages to userspace via a TCP socket");
+MODULE_PARM_DESC(
+	target_comm,
+	"Comm name to be analyzed; only this specified comm has access to the TCP socket");
 
 static struct socket *sock = NULL;
 
@@ -123,16 +130,45 @@ static ssize_t lsm_receive_reply_tcp(char *buf)
 
 struct mapping_info {
 	char name[TASK_COMM_LEN];
-	unsigned long pid;
+	char args[MAX_ARG_LEN];
+	char anon_name[MAX_ANON_NAME];
 	unsigned long init_addr;
 	unsigned long
 		mapped_addr; /* when sending via tcp, will use this as offset */
 	unsigned long mapping_len;
 	unsigned long len;
 	unsigned long prot;
-	unsigned long is_file_backed;
 	unsigned long is_end_of_mapping;
 };
+
+inline void set_mapping_info(struct mapping_info *info, char *name, char *args,
+			     char *anon_name, unsigned long init_addr,
+			     unsigned long mapped_addr,
+			     unsigned long mapping_len, unsigned long len,
+			     unsigned long prot,
+			     unsigned long is_end_of_mapping)
+{
+	info->init_addr = init_addr;
+	info->mapped_addr = mapped_addr;
+	info->mapping_len = mapping_len;
+	info->len = len;
+	info->prot = prot;
+	info->is_end_of_mapping = is_end_of_mapping;
+	if (name)
+		memcpy(info->name, name, TASK_COMM_LEN);
+	else
+		memset(info->name, 0, TASK_COMM_LEN);
+	if (args)
+		memcpy(info->args, args, MAX_ARG_LEN);
+	else
+		memset(info->args, 0, MAX_ARG_LEN);
+	if (anon_name) {
+		strncpy(info->anon_name, anon_name, MAX_ANON_NAME - 1);
+		info->anon_name[MAX_ANON_NAME - 1] = '\0';
+	} else {
+		memset(info->anon_name, 0, MAX_ANON_NAME);
+	}
+}
 
 static int lsm_init_tcp_connection(void)
 {
@@ -190,7 +226,7 @@ static int lsm_send_to_userspace(struct mapping_info *map_info)
 		return -ENOMEM;
 	}
 	// Add the pid attribute to the message
-	ret = nla_put_u64_64bit(skb, LSM_ATTR_PID, map_info->pid, 0);
+	ret = nla_put_u64_64bit(skb, LSM_ATTR_PID, 0, 0);
 	if (ret) {
 		pr_err("LSM: Failed to add pid attribute to Netlink message");
 		genlmsg_cancel(skb, msg_head);
@@ -227,8 +263,7 @@ static int lsm_send_to_userspace(struct mapping_info *map_info)
 		nlmsg_free(skb);
 		return ret;
 	}
-	ret = nla_put_u64_64bit(skb, LSM_ATTR_IS_FILE_BACKED,
-				map_info->is_file_backed, 0);
+	ret = nla_put_u64_64bit(skb, LSM_ATTR_IS_FILE_BACKED, 0, 0);
 	if (ret) {
 		pr_err("LSM: Failed to add is_file_backed attribute to Netlink message");
 		genlmsg_cancel(skb, msg_head);
@@ -467,11 +502,13 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 	struct vm_area_struct *vma;
 	struct walk_ctx ctx = { 0 };
 
+	if (strncmp(current->comm, target_comm, TASK_COMM_LEN) != 0)
+		return SKIPPED;
 	if (!sock && lsm_init_tcp_connection() != 0)
 		return SKIPPED;
 	if (!addr || !len)
 		return -EINVAL;
-	if (!(prot & PROT_EXEC))
+	if (!(prot & PROT_EXEC) && !(prot & PROT_WRITE))
 		return SKIPPED;
 
 	vma = find_vma(current->mm, addr);
@@ -495,15 +532,56 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 	if (!ctx.pages)
 		return -ENOMEM;
 
-	struct mapping_info info = { .pid = current->pid,
-				     .init_addr = addr,
-				     .mapped_addr = 0,
-				     .mapping_len = len,
-				     .len = 0,
-				     .prot = prot,
-				     .is_file_backed = vma->vm_file != NULL,
-				     .is_end_of_mapping = 0 };
-	memcpy(info.name, current->comm, TASK_COMM_LEN);
+	struct mapping_info info;
+	char args[MAX_ARG_LEN] = { 0 };
+	struct mm_struct *mm = current->mm;
+
+	// We cannot use get_cmdline because it fights for the same lock mmap and mprotect use, creating a deadlock
+	if (mm && mm->arg_end > mm->arg_start) {
+		char temp_buf[1024] = { 0 };
+		unsigned long arg_start = mm->arg_start;
+		unsigned long arg_len = mm->arg_end - arg_start;
+
+		if (arg_len >= sizeof(temp_buf)) {
+			arg_len = sizeof(temp_buf) - 1;
+		}
+
+		int ret = copy_from_user_nofault(
+			temp_buf, (const void __user *)arg_start, arg_len);
+
+		if (ret == 0) {
+			int i = 0;
+
+			while (i < arg_len && temp_buf[i] != '\0') {
+				i++;
+			}
+			i++;
+
+			if (i < arg_len && temp_buf[i] != '\0') {
+				char *sec_arg = &temp_buf[i];
+
+				int j = 0;
+				while ((sec_arg + j) < (temp_buf + arg_len) &&
+				       sec_arg[j] != '\0') {
+					args[j] = sec_arg[j];
+					j++;
+					if (j == MAX_ARG_LEN - 1)
+						break;
+				}
+				args[j] = '\0';
+			} else {
+				args[0] = '\0';
+			}
+		} else {
+			args[0] = '\0';
+		}
+	}
+
+	struct anon_vma_name *avn = anon_vma_name(vma);
+	char *vma_name = avn ? (char *)avn->name : NULL;
+
+	set_mapping_info(&info, current->comm, args, vma_name, addr, 0, len, 0,
+			 prot, 0);
 
 	ctx.info = &info;
 	walk_page_range(current->mm, addr, addr + len, &lsm_walk_ops, &ctx);
@@ -517,6 +595,7 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 
 	char buf[4];
 	ssize_t reply_len = lsm_receive_reply_tcp(buf);
+
 	if (reply_len < 4) {
 		return SKIPPED;
 	}
@@ -537,16 +616,9 @@ static int send_bpf_data_tcp(struct bpf_prog *prog)
 	if (!sock && lsm_init_tcp_connection() != 0)
 		return SKIPPED;
 
-	memset(&info, 0, sizeof(info));
-	info.pid = current->pid;
-	info.init_addr = 0;
-	info.mapped_addr = 0;
-	info.mapping_len = prog->jited_len;
-	info.len = prog->jited_len;
-	info.prot = PROT_READ | PROT_EXEC;
-	info.is_file_backed = 0;
-	info.is_end_of_mapping = 1;
-	memcpy(info.name, current->comm, TASK_COMM_LEN);
+	set_mapping_info(&info, current->comm, NULL, NULL, 0, 0,
+			 prog->jited_len, prog->jited_len,
+			 PROT_READ | PROT_EXEC, 1);
 
 	lsm_send_to_userspace_tcp((char *)&info, sizeof(info));
 	lsm_send_to_userspace_tcp((char *)prog->bpf_func, prog->jited_len);
@@ -630,15 +702,9 @@ static int mcheck_custom_mmap_hook(unsigned long addr, unsigned long len,
 		return 0;
 	}
 
-	struct mapping_info info = {
-		.pid = current->pid,
-		.init_addr = addr,
-		.mapped_addr = analyzer_data->address,
-		.len = len,
-		.prot = prot,
-		.is_file_backed = vma->vm_file != NULL,
-	};
-	memcpy(info.name, current->comm, TASK_COMM_LEN);
+	struct mapping_info info;
+	set_mapping_info(&info, current->comm, NULL, NULL, addr,
+			 analyzer_data->address, 0, len, prot, 0);
 	// send info to user-space
 	lsm_send_to_userspace(&info);
 
@@ -786,15 +852,9 @@ static int mcheck_custom_mprotect_hook(unsigned long addr, unsigned long len,
 
 	if (remapping_ok) {
 		pr_info("mcheck_custom_mprotect_hook: remapping ok");
-		struct mapping_info info = {
-			.pid = current->pid,
-			.init_addr = addr,
-			.mapped_addr = analyzer_data->address,
-			.len = len,
-			.prot = prot,
-			.is_file_backed = analyzer_vma->vm_file != NULL,
-		};
-		memcpy(info.name, current->comm, TASK_COMM_LEN);
+		struct mapping_info info;
+		set_mapping_info(&info, current->comm, NULL, NULL, addr,
+				 analyzer_data->address, 0, len, prot, 0);
 		lsm_send_to_userspace(&info);
 		wait_for_completion(&analyzer_ready);
 		reinit_completion(&analyzer_ready);
@@ -876,11 +936,9 @@ static int bpf_prog_hook(struct bpf_prog *prog, union bpf_attr *attr,
 		return 0;
 	}
 
-	struct mapping_info info = { .pid = current->pid,
-				     .init_addr = 0,
-				     .mapped_addr = analyzer_data->address,
-				     .len = prog->jited_len,
-				     .is_file_backed = 0 };
+	struct mapping_info info;
+	set_mapping_info(&info, current->comm, NULL, NULL, 0,
+			 analyzer_data->address, 0, prog->jited_len, 0, 0);
 	// send info to user-space
 	lsm_send_to_userspace(&info);
 
