@@ -502,13 +502,11 @@ static int send_pages_to_userspace_tcp(unsigned long addr, unsigned long len,
 	struct vm_area_struct *vma;
 	struct walk_ctx ctx = { 0 };
 
-	if (strncmp(current->comm, target_comm, TASK_COMM_LEN) != 0)
-		return SKIPPED;
 	if (!sock && lsm_init_tcp_connection() != 0)
 		return SKIPPED;
 	if (!addr || !len)
 		return -EINVAL;
-	if (!(prot & PROT_EXEC) && !(prot & PROT_WRITE))
+	if (!(prot & PROT_EXEC))
 		return SKIPPED;
 
 	vma = find_vma(current->mm, addr);
